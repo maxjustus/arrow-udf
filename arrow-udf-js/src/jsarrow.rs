@@ -65,12 +65,22 @@ pub fn get_jsvalue<'a>(
             let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             ctx.json_parse(array.value(i))
         }
-        // decimal type
+        // databend json type
         DataType::LargeBinary => {
-            let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            let string = std::str::from_utf8(array.value(i))?;
-            bigdecimal.call((string,))
+            let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            ctx.json_parse(array.value(i))
+            // check if the array is actually json
+            // let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            // let string = std::str::from_utf8(array.value(i))?;
+            // bigdecimal.call((string,))
         }
+        // databend decimal type
+        // DataType::Decimal256(precision, scale) => {
+        //     let array = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+        //     let decimal = array.value(i);
+        //     let string = decimal.to_string();
+        //     bigdecimal.call((string,))
+        // }
         // list
         DataType::List(inner) => {
             let array = array.as_any().downcast_ref::<ListArray>().unwrap();

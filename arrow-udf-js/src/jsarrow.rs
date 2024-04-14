@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Convert arrow array from/to python objects.
+//! Convert arrow array from/to js objects.
 
 use anyhow::{Context, Result};
-use arrow_array::{array::*, builder::*};
-use arrow_buffer::OffsetBuffer;
+use arrow_array::{array::*, builder::*, ArrowNativeTypeOp};
+use arrow_buffer::{OffsetBuffer, i256};
 use arrow_schema::{DataType, Field};
 use rquickjs::{function::Args, Ctx, Error, FromJs, Function, IntoJs, Object, TypedArray, Value};
 use std::sync::Arc;
@@ -33,85 +33,6 @@ macro_rules! get_typed_array {
         let array = $array.as_any().downcast_ref::<$array_type>().unwrap();
         TypedArray::new($ctx.clone(), array.values().as_ref()).map(|a| a.into_value())
     }};
-}
-
-/// Get array element as a JS Value.
-pub fn get_jsvalue<'a>(
-    ctx: &Ctx<'a>,
-    bigdecimal: &Function<'a>,
-    field: &Field,
-    array: &dyn Array,
-    i: usize,
-) -> Result<Value<'a>, Error> {
-    if array.is_null(i) {
-        return Ok(Value::new_null(ctx.clone()));
-    }
-    match array.data_type() {
-        DataType::Null => Ok(Value::new_null(ctx.clone())),
-        DataType::Boolean => get_jsvalue!(BooleanArray, ctx, array, i),
-        DataType::Int8 => get_jsvalue!(Int8Array, ctx, array, i),
-        DataType::Int16 => get_jsvalue!(Int16Array, ctx, array, i),
-        DataType::Int32 => get_jsvalue!(Int32Array, ctx, array, i),
-        DataType::Int64 => get_jsvalue!(Int64Array, ctx, array, i),
-        DataType::UInt8 => get_jsvalue!(UInt8Array, ctx, array, i),
-        DataType::UInt16 => get_jsvalue!(UInt16Array, ctx, array, i),
-        DataType::UInt32 => get_jsvalue!(UInt32Array, ctx, array, i),
-        DataType::UInt64 => get_jsvalue!(UInt64Array, ctx, array, i),
-        DataType::Float32 => get_jsvalue!(Float32Array, ctx, array, i),
-        DataType::Float64 => get_jsvalue!(Float64Array, ctx, array, i),
-        DataType::Utf8 => match field
-            .metadata()
-            .get("ARROW:extension:name")
-            .map(|s| s.as_str())
-        {
-            Some("arrowudf.json") => {
-                let array = array.as_any().downcast_ref::<StringArray>().unwrap();
-                ctx.json_parse(array.value(i))
-            }
-            Some("arrowudf.decimal") => {
-                let array = array.as_any().downcast_ref::<StringArray>().unwrap();
-                bigdecimal.call((array.value(i),))
-            }
-            _ => get_jsvalue!(StringArray, ctx, array, i),
-        },
-        DataType::LargeUtf8 => get_jsvalue!(LargeStringArray, ctx, array, i),
-        DataType::Binary => get_jsvalue!(BinaryArray, ctx, array, i),
-        DataType::LargeBinary => get_jsvalue!(LargeBinaryArray, ctx, array, i),
-        // list
-        DataType::List(inner) => {
-            let array = array.as_any().downcast_ref::<ListArray>().unwrap();
-            let list = array.value(i);
-            match inner.data_type() {
-                DataType::Int8 => get_typed_array!(Int8Array, ctx, list),
-                DataType::Int16 => get_typed_array!(Int16Array, ctx, list),
-                DataType::Int32 => get_typed_array!(Int32Array, ctx, list),
-                DataType::Int64 => get_typed_array!(Int64Array, ctx, list),
-                DataType::UInt8 => get_typed_array!(UInt8Array, ctx, list),
-                DataType::UInt16 => get_typed_array!(UInt16Array, ctx, list),
-                DataType::UInt32 => get_typed_array!(UInt32Array, ctx, list),
-                DataType::UInt64 => get_typed_array!(UInt64Array, ctx, list),
-                DataType::Float32 => get_typed_array!(Float32Array, ctx, list),
-                DataType::Float64 => get_typed_array!(Float64Array, ctx, list),
-                _ => {
-                    let mut values = Vec::with_capacity(list.len());
-                    for j in 0..list.len() {
-                        values.push(get_jsvalue(ctx, bigdecimal, inner, list.as_ref(), j)?);
-                    }
-                    values.into_js(ctx)
-                }
-            }
-        }
-        DataType::Struct(fields) => {
-            let array = array.as_any().downcast_ref::<StructArray>().unwrap();
-            let object = Object::new(ctx.clone())?;
-            for (j, field) in fields.iter().enumerate() {
-                let value = get_jsvalue(ctx, bigdecimal, field, array.column(j).as_ref(), i)?;
-                object.set(field.name(), value)?;
-            }
-            Ok(object.into_value())
-        }
-        t => todo!("unsupported data type: {:?}", t),
-    }
 }
 
 macro_rules! build_array {
@@ -152,8 +73,128 @@ macro_rules! build_array {
     }};
 }
 
-/// Build arrow array from JS objects.
-pub fn build_array<'a>(field: &Field, ctx: &Ctx<'a>, values: Vec<Value<'a>>) -> Result<ArrayRef> {
+macro_rules! build_json_array {
+    ($array_type: ty, $ctx:expr, $values:expr) => {{
+        let mut builder = <$array_type>::with_capacity($values.len(), 1024);
+        for val in $values {
+            if val.is_null() || val.is_undefined() {
+                builder.append_null();
+            } else if let Some(s) = $ctx.json_stringify(val)? {
+                builder.append_value(s.to_string()?);
+            } else {
+                builder.append_null();
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }};
+}
+
+/// Get array element as a JS Value.
+pub fn get_jsvalue<'a>(
+    ctx: &Ctx<'a>,
+    bigdecimal: &rquickjs::Function<'a>,
+    field: &Field,
+    array: &dyn Array,
+    i: usize,
+) -> Result<Value<'a>, Error> {
+    if array.is_null(i) {
+        return Ok(Value::new_null(ctx.clone()));
+    }
+
+    match array.data_type() {
+        DataType::Null => Ok(Value::new_null(ctx.clone())),
+        DataType::Boolean => get_jsvalue!(BooleanArray, ctx, array, i),
+        DataType::Int8 => get_jsvalue!(Int8Array, ctx, array, i),
+        DataType::Int16 => get_jsvalue!(Int16Array, ctx, array, i),
+        DataType::Int32 => get_jsvalue!(Int32Array, ctx, array, i),
+        DataType::Int64 => get_jsvalue!(Int64Array, ctx, array, i),
+        DataType::UInt8 => get_jsvalue!(UInt8Array, ctx, array, i),
+        DataType::UInt16 => get_jsvalue!(UInt16Array, ctx, array, i),
+        DataType::UInt32 => get_jsvalue!(UInt32Array, ctx, array, i),
+        DataType::UInt64 => get_jsvalue!(UInt64Array, ctx, array, i),
+        DataType::Float32 => get_jsvalue!(Float32Array, ctx, array, i),
+        DataType::Float64 => get_jsvalue!(Float64Array, ctx, array, i),
+        DataType::Utf8 => match field
+            .metadata()
+            .get("ARROW:extension:name")
+            .map(|s| s.as_str())
+        {
+            Some("arrowudf.json") | Some("Variant") => {
+                let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+                ctx.json_parse(array.value(i))
+            }
+            Some("arrowudf.decimal") => {
+                let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+                bigdecimal.call((array.value(i),))
+            }
+            _ => get_jsvalue!(StringArray, ctx, array, i),
+        },
+        DataType::Binary => get_jsvalue!(BinaryArray, ctx, array, i),
+        DataType::LargeUtf8 => get_jsvalue!(LargeStringArray, ctx, array, i),
+        DataType::LargeBinary => match field
+            .metadata()
+            .get("ARROW:extension:name")
+            .map(|s| s.as_str())
+        {
+            Some("arrowudf.json") | Some("Variant") => {
+                let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                let string = std::str::from_utf8(array.value(i))?;
+                ctx.json_parse(string)
+            }
+            _ => get_jsvalue!(LargeBinaryArray, ctx, array, i),
+        },
+        DataType::Decimal128(_, _) => {
+            let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let decimal_str = array.value_as_string(i);
+            bigdecimal.call((decimal_str,))
+        },
+        DataType::Decimal256(_, _) => {
+            let array = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let decimal_str = array.value_as_string(i);
+            bigdecimal.call((decimal_str,))
+        },
+        // list
+        DataType::List(inner) => {
+            let array = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let list = array.value(i);
+            match inner.data_type() {
+                DataType::Int8 => get_typed_array!(Int8Array, ctx, list),
+                DataType::Int16 => get_typed_array!(Int16Array, ctx, list),
+                DataType::Int32 => get_typed_array!(Int32Array, ctx, list),
+                DataType::Int64 => get_typed_array!(Int64Array, ctx, list),
+                DataType::UInt8 => get_typed_array!(UInt8Array, ctx, list),
+                DataType::UInt16 => get_typed_array!(UInt16Array, ctx, list),
+                DataType::UInt32 => get_typed_array!(UInt32Array, ctx, list),
+                DataType::UInt64 => get_typed_array!(UInt64Array, ctx, list),
+                DataType::Float32 => get_typed_array!(Float32Array, ctx, list),
+                DataType::Float64 => get_typed_array!(Float64Array, ctx, list),
+                _ => {
+                    let mut values = Vec::with_capacity(list.len());
+                    for j in 0..list.len() {
+                        values.push(get_jsvalue(ctx, bigdecimal, field, list.as_ref(), j)?);
+                    }
+                    values.into_js(ctx)
+                }
+            }
+        }
+        DataType::Struct(fields) => {
+            let array = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let object = Object::new(ctx.clone())?;
+            for (j, field) in fields.iter().enumerate() {
+                let value = get_jsvalue(ctx, bigdecimal, field, array.column(j).as_ref(), i)?;
+                object.set(field.name(), value)?;
+            }
+            Ok(object.into_value())
+        }
+        t => todo!("unsupported data type: {:?}", t),
+    }
+}
+
+pub fn build_array<'a>(
+    field: &Field,
+    ctx: &Ctx<'a>,
+    values: Vec<Value<'a>>,
+) -> Result<ArrayRef> {
     match field.data_type() {
         DataType::Null => build_array!(NullBuilder, ctx, values),
         DataType::Boolean => build_array!(BooleanBuilder, ctx, values),
@@ -172,33 +213,24 @@ pub fn build_array<'a>(field: &Field, ctx: &Ctx<'a>, values: Vec<Value<'a>>) -> 
             .get("ARROW:extension:name")
             .map(|s| s.as_str())
         {
-            Some("arrowudf.json") => {
-                let mut builder = StringBuilder::with_capacity(values.len(), 1024);
-                for val in values {
-                    if val.is_null() || val.is_undefined() {
-                        builder.append_null();
-                    } else if let Some(s) = ctx.json_stringify(val)? {
-                        builder.append_value(s.to_string()?);
-                    } else {
-                        builder.append_null();
-                    }
-                }
-                Ok(Arc::new(builder.finish()))
-            }
+            Some("arrowudf.json") | Some("Variant") => build_json_array!(StringBuilder, ctx, values),
             Some("arrowudf.decimal") => {
                 let mut builder = StringBuilder::with_capacity(values.len(), 1024);
                 let bigdecimal_to_string: Function = ctx
                     .eval("BigDecimal.prototype.toString")
                     .context("failed to get BigDecimal.prototype.string")?;
+
                 for val in values {
                     if val.is_null() || val.is_undefined() {
                         builder.append_null();
                     } else {
                         let mut args = Args::new(ctx.clone(), 0);
                         args.this(val)?;
+
                         let string: String = bigdecimal_to_string.call_arg(args).context(
                             "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
                         )?;
+
                         builder.append_value(string);
                     }
                 }
@@ -208,7 +240,67 @@ pub fn build_array<'a>(field: &Field, ctx: &Ctx<'a>, values: Vec<Value<'a>>) -> 
         },
         DataType::LargeUtf8 => build_array!(LargeStringBuilder, String, ctx, values),
         DataType::Binary => build_array!(BinaryBuilder, Vec::<u8>, ctx, values),
-        DataType::LargeBinary => build_array!(LargeBinaryBuilder, Vec::<u8>, ctx, values),
+        // decimal type
+        DataType::LargeBinary => match field
+            .metadata()
+            .get("ARROW:extension:name")
+            .map(|s| s.as_str())
+        {
+            Some("arrowudf.json") | Some("Variant") => build_json_array!(LargeBinaryBuilder, ctx, values),
+            _ => build_array!(LargeBinaryBuilder, Vec::<u8>, ctx, values)
+        },
+        DataType::Decimal128(precision, scale) => {
+            let mut builder = Decimal128Builder::with_capacity(values.len())
+                .with_precision_and_scale(*precision, *scale)?;
+
+            let bigdecimal_to_string: Function = ctx
+                .eval("BigDecimal.prototype.toString")
+                .context("failed to get BigDecimal.prototype.string")?;
+
+            for val in values {
+                if val.is_null() || val.is_undefined() {
+                    builder.append_null();
+                } else {
+                    let mut args = Args::new(ctx.clone(), 0);
+                    args.this(val)?;
+                    let string: String = bigdecimal_to_string.call_arg(args).context(
+                        "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
+                        )?;
+
+                    // TODO: make into macro - the only parts that are different are the builder
+                    // instance and this logic that determines how the value is computed.
+                    let decimal_integer = decimal_string_to_i256(&string, *scale)?
+                        .to_i128()
+                        .ok_or_else(|| anyhow::anyhow!("failed to convert to i128"))?;
+
+                    builder.append_value(decimal_integer);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        },
+        DataType::Decimal256(precision, scale) => {
+            let mut builder = Decimal256Builder::with_capacity(values.len())
+                .with_precision_and_scale(*precision, *scale)?;
+
+            let bigdecimal_to_string: Function = ctx
+                .eval("BigDecimal.prototype.toString")
+                .context("failed to get BigDecimal.prototype.string")?;
+
+            for val in values {
+                if val.is_null() || val.is_undefined() {
+                    builder.append_null();
+                } else {
+                    let mut args = Args::new(ctx.clone(), 0);
+                    args.this(val)?;
+                    let string: String = bigdecimal_to_string.call_arg(args).context(
+                        "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
+                        )?;
+                    let decimal_integer = decimal_string_to_i256(&string, *scale)?;
+                    builder.append_value(decimal_integer);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        },
         // list
         DataType::List(inner) => {
             // flatten lists
@@ -264,4 +356,20 @@ pub fn build_array<'a>(field: &Field, ctx: &Ctx<'a>, values: Vec<Value<'a>>) -> 
         }
         t => todo!("unsupported data type: {:?}", t),
     }
+}
+
+fn decimal_string_to_i256(s: &str, scale: i8) -> Result<i256> {
+    if scale < 0 {
+        return Err(anyhow::anyhow!("currently only supports non-negative scale"));
+    }
+
+   let parts = s.split('.').collect::<Vec<&str>>();
+   let integer = i256::from_string(parts[0]).ok_or_else(|| anyhow::anyhow!("failed to parse integer part"))?;
+   let fractional = if parts.len() == 1 {
+       i256::ZERO
+   } else {
+       i256::from_string(parts[1]).ok_or_else(|| anyhow::anyhow!("failed to parse fractional part"))?
+   };
+
+   Ok((integer * i256::from_i128(10).pow_checked(scale as u32)?) + fractional)
 }

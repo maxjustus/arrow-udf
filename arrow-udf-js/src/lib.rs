@@ -22,10 +22,10 @@ use anyhow::{anyhow, Context as _, Result};
 use arrow_array::{builder::Int32Builder, RecordBatch};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use rquickjs::{
-    context::intrinsic::{BaseObjects, BigDecimal, Eval, Json, TypedArrays},
     function::Args,
     Context, Ctx, Object, Persistent, Value,
 };
+use rquickjs::context::intrinsic::All;
 
 use self::into_field::IntoField;
 
@@ -79,9 +79,8 @@ impl Runtime {
     /// Create a new JS UDF runtime from a JS code.
     pub fn new() -> Result<Self> {
         let runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
-        // `Eval` is required to compile JS code.
         let context =
-            rquickjs::Context::custom::<(BaseObjects, Eval, Json, BigDecimal, TypedArrays)>(
+            rquickjs::Context::custom::<All>(
                 &runtime,
             )
             .context("failed to create quickjs context")?;
@@ -151,6 +150,7 @@ impl Runtime {
                 for (column, field) in input.columns().iter().zip(input.schema().fields()) {
                     let val = jsarrow::get_jsvalue(&ctx, &bigdecimal, field, column, i)
                         .context("failed to get jsvalue from arrow array")?;
+
                     row.push(val);
                 }
                 if function.mode == CallMode::ReturnNullOnNullInput
@@ -167,6 +167,7 @@ impl Runtime {
                     .context("failed to call function")?;
                 results.push(result);
             }
+
             let array = jsarrow::build_array(&function.return_field, &ctx, results)
                 .context("failed to build arrow array from return values")?;
             let schema = Schema::new(vec![function.return_field.clone()]);
@@ -266,6 +267,7 @@ impl RecordBatchIter<'_> {
                     }
                     let mut args = Args::new(ctx.clone(), row.len());
                     args.push_args(row.drain(..))?;
+                    // TODO: can this raise the JS error to the caller?
                     let gen = js_function
                         .call_arg::<Object>(args)
                         .map_err(|e| check_exception(e, &ctx))

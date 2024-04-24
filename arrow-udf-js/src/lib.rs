@@ -19,13 +19,15 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
-use arrow_array::{builder::Int32Builder, Array, RecordBatch};
+use arrow_array::{builder::Int32Builder, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use jsarrow::{Converter, DefaultConverter};
 use rquickjs::{
-    context::intrinsic::{BaseObjects, BigDecimal, Eval, Json, TypedArrays},
     function::Args,
     Context, Ctx, Object, Persistent, Value,
 };
+
+use rquickjs::context::intrinsic::{BaseObjects, Date, Eval, Json, MapSet, BigDecimal, TypedArrays};
 
 mod jsarrow;
 
@@ -78,7 +80,9 @@ impl Runtime {
         let runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
         // `Eval` is required to compile JS code.
         let context =
-            rquickjs::Context::custom::<(BaseObjects, Eval, Json, BigDecimal, TypedArrays)>(
+            // TODO: make sure all needed features are enabled - Date is important for this to be
+            // useful
+            rquickjs::Context::custom::<(BaseObjects, MapSet, Date, Eval, Json, BigDecimal, TypedArrays)>(
                 &runtime,
             )
             .context("failed to create quickjs context")?;
@@ -134,20 +138,23 @@ impl Runtime {
         Ok(())
     }
 
+
     /// Call the JS UDF.
     pub fn call(&self, name: &str, input: &RecordBatch) -> Result<RecordBatch> {
         let function = self.functions.get(name).context("function not found")?;
         // convert each row to python objects and call the function
         self.context.with(|ctx| {
             let bigdecimal = self.bigdecimal.clone().restore(&ctx)?;
+            let converter = DefaultConverter{};
             let js_function = function.function.clone().restore(&ctx)?;
             let mut results = Vec::with_capacity(input.num_rows());
             let mut row = Vec::with_capacity(input.num_columns());
             for i in 0..input.num_rows() {
                 row.clear();
                 for column in input.columns() {
-                    let val = jsarrow::get_jsvalue(&ctx, &bigdecimal, column, i)
+                    let val = converter.get_jsvalue(&ctx, &bigdecimal, column, i)
                         .context("failed to get jsvalue from arrow array")?;
+
                     row.push(val);
                 }
                 if function.mode == CallMode::ReturnNullOnNullInput
@@ -164,7 +171,11 @@ impl Runtime {
                     .context("failed to call function")?;
                 results.push(result);
             }
-            let array = jsarrow::build_array(&function.return_type, &ctx, results)
+            // TODO: make build_array something that hangs off a struct that implements
+            // an interface so we can customize it..
+            // or may it can take a function that allows you to customize conversion
+            // and fall back to a default implementation
+            let array = converter.build_array(&function.return_type, &ctx, results)
                 .context("failed to build arrow array from return values")?;
             let schema = Schema::new(vec![Field::new(name, array.data_type().clone(), true)]);
             Ok(RecordBatch::try_new(Arc::new(schema), vec![array])?)
@@ -201,6 +212,7 @@ impl Runtime {
 /// An iterator over the result of a table function.
 pub struct RecordBatchIter<'a> {
     context: &'a Context,
+    // oh this becomes the converter I think
     bigdecimal: &'a Persistent<rquickjs::Function<'static>>,
     input: &'a RecordBatch,
     function: &'a Function,
@@ -228,6 +240,7 @@ impl RecordBatchIter<'_> {
         }
         self.context.with(|ctx| {
             let bigdecimal = self.bigdecimal.clone().restore(&ctx)?;
+            let converter = DefaultConverter{};
             let js_function = self.function.function.clone().restore(&ctx)?;
             let mut indexes = Int32Builder::with_capacity(self.chunk_size);
             let mut results = Vec::with_capacity(self.input.num_rows());
@@ -249,7 +262,11 @@ impl RecordBatchIter<'_> {
                     // call the table function to get a generator
                     row.clear();
                     for column in self.input.columns() {
-                        let val = jsarrow::get_jsvalue(&ctx, &bigdecimal, column, self.row)
+                        // TODO: make get_jsvalue something that hangs off a struct that implements
+                        // an interface so we can customize it..
+                        // or may it can take a function that allows you to customize conversion
+                        // and fall back to a default implementation
+                        let val = converter.get_jsvalue(&ctx, &bigdecimal, column, self.row)
                             .context("failed to get jsvalue from arrow array")?;
                         row.push(val);
                     }
@@ -261,6 +278,7 @@ impl RecordBatchIter<'_> {
                     }
                     let mut args = Args::new(ctx.clone(), row.len());
                     args.push_args(row.drain(..))?;
+                    // TODO: can this raise the JS error to the caller?
                     let gen = js_function
                         .call_arg::<Object>(args)
                         .map_err(|e| check_exception(e, &ctx))
@@ -293,7 +311,7 @@ impl RecordBatchIter<'_> {
                 return Ok(None);
             }
             let indexes = Arc::new(indexes.finish());
-            let array = jsarrow::build_array(&self.function.return_type, &ctx, results)
+            let array = converter.build_array(&self.function.return_type, &ctx, results)
                 .context("failed to build arrow array from return values")?;
             Ok(Some(RecordBatch::try_new(
                 self.schema.clone(),

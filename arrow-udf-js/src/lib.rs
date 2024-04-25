@@ -27,9 +27,9 @@ use rquickjs::{
     Context, Ctx, Object, Persistent, Value,
 };
 
-use rquickjs::context::intrinsic::{BaseObjects, Date, Eval, Json, MapSet, BigDecimal, TypedArrays};
+use rquickjs::context::intrinsic::All;
 
-mod jsarrow;
+pub mod jsarrow;
 
 /// The JS UDF runtime.
 pub struct Runtime {
@@ -38,6 +38,7 @@ pub struct Runtime {
     bigdecimal: Persistent<rquickjs::Function<'static>>,
     // NOTE: `functions` and `bigdecimal` must be put before the runtime and context to be dropped first.
     _runtime: rquickjs::Runtime,
+    converter: Arc<dyn Converter>,
     context: Context,
 }
 
@@ -78,11 +79,8 @@ impl Runtime {
     /// Create a new JS UDF runtime from a JS code.
     pub fn new() -> Result<Self> {
         let runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
-        // `Eval` is required to compile JS code.
         let context =
-            // TODO: make sure all needed features are enabled - Date is important for this to be
-            // useful
-            rquickjs::Context::custom::<(BaseObjects, MapSet, Date, Eval, Json, BigDecimal, TypedArrays)>(
+            rquickjs::Context::custom::<All>(
                 &runtime,
             )
             .context("failed to create quickjs context")?;
@@ -94,8 +92,13 @@ impl Runtime {
             functions: HashMap::new(),
             bigdecimal,
             _runtime: runtime,
+            converter: Arc::new(DefaultConverter{}),
             context,
         })
+    }
+
+    pub fn set_custom_converter(&mut self, converter: Arc<dyn Converter>) {
+        self.converter = converter;
     }
 
     /// Add a JS function.
@@ -138,21 +141,19 @@ impl Runtime {
         Ok(())
     }
 
-
     /// Call the JS UDF.
     pub fn call(&self, name: &str, input: &RecordBatch) -> Result<RecordBatch> {
         let function = self.functions.get(name).context("function not found")?;
         // convert each row to python objects and call the function
         self.context.with(|ctx| {
             let bigdecimal = self.bigdecimal.clone().restore(&ctx)?;
-            let converter = DefaultConverter{};
             let js_function = function.function.clone().restore(&ctx)?;
             let mut results = Vec::with_capacity(input.num_rows());
             let mut row = Vec::with_capacity(input.num_columns());
             for i in 0..input.num_rows() {
                 row.clear();
                 for column in input.columns() {
-                    let val = converter.get_jsvalue(&ctx, &bigdecimal, column, i)
+                    let val = self.converter.get_jsvalue(&ctx, &bigdecimal, column, i)
                         .context("failed to get jsvalue from arrow array")?;
 
                     row.push(val);
@@ -171,11 +172,8 @@ impl Runtime {
                     .context("failed to call function")?;
                 results.push(result);
             }
-            // TODO: make build_array something that hangs off a struct that implements
-            // an interface so we can customize it..
-            // or may it can take a function that allows you to customize conversion
-            // and fall back to a default implementation
-            let array = converter.build_array(&function.return_type, &ctx, results)
+
+            let array = self.converter.build_array(&function.return_type, &ctx, results)
                 .context("failed to build arrow array from return values")?;
             let schema = Schema::new(vec![Field::new(name, array.data_type().clone(), true)]);
             Ok(RecordBatch::try_new(Arc::new(schema), vec![array])?)
@@ -262,10 +260,6 @@ impl RecordBatchIter<'_> {
                     // call the table function to get a generator
                     row.clear();
                     for column in self.input.columns() {
-                        // TODO: make get_jsvalue something that hangs off a struct that implements
-                        // an interface so we can customize it..
-                        // or may it can take a function that allows you to customize conversion
-                        // and fall back to a default implementation
                         let val = converter.get_jsvalue(&ctx, &bigdecimal, column, self.row)
                             .context("failed to get jsvalue from arrow array")?;
                         row.push(val);

@@ -80,6 +80,16 @@ macro_rules! build_array {
 // passing directly could work in a way where the passed functions are first
 // line of defense and the default converter is used as a fallback.
 pub trait Converter {
+    fn custom_get_jsvalue<'a>(
+        &self,
+        _ctx: &Ctx<'a>,
+        _bigdecimal: &rquickjs::Function<'a>,
+        _array: &dyn Array,
+        _i: usize,
+    ) -> Option<Result<Value<'a>, Error>> {
+        None
+    }
+
     /// Get array element as a JS Value.
     fn get_jsvalue<'a>(
         &self,
@@ -91,6 +101,11 @@ pub trait Converter {
         if array.is_null(i) {
             return Ok(Value::new_null(ctx.clone()));
         }
+
+        if let Some(result) = self.custom_get_jsvalue(ctx, bigdecimal, array, i) {
+            return result;
+        }
+
         match array.data_type() {
             DataType::Null => Ok(Value::new_null(ctx.clone())),
             DataType::Boolean => get_jsvalue!(BooleanArray, ctx, array, i),
@@ -107,8 +122,16 @@ pub trait Converter {
             DataType::Utf8 => get_jsvalue!(StringArray, ctx, array, i),
             DataType::Binary => get_jsvalue!(BinaryArray, ctx, array, i),
             // json type
-            DataType::LargeUtf8 => self.get_large_utf8_jsvalue(ctx, bigdecimal, array, i),
-            DataType::LargeBinary => self.get_large_binary_jsvalue(ctx, bigdecimal, array, i),
+            DataType::LargeUtf8 => {
+                let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                ctx.json_parse(array.value(i))
+            },
+            // decimal type
+            DataType::LargeBinary => {
+                let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                let string = std::str::from_utf8(array.value(i))?;
+                bigdecimal.call((string,))
+            },
             // list
             DataType::List(inner) => {
                 let array = array.as_any().downcast_ref::<ListArray>().unwrap();
@@ -146,29 +169,13 @@ pub trait Converter {
         }
     }
 
-    fn get_large_utf8_jsvalue<'a>(
+    fn custom_build_array<'a>(
         &self,
-        ctx: &Ctx<'a>,
-        _bigdecimal: &rquickjs::Function<'a>,
-        array: &dyn Array,
-        i: usize,
-    ) -> Result<Value<'a>, Error> {
-        // json type by default
-        let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-        ctx.json_parse(array.value(i))
-    }
-
-    fn get_large_binary_jsvalue<'a>(
-        &self,
+        _data_type: &DataType,
         _ctx: &Ctx<'a>,
-        bigdecimal: &rquickjs::Function<'a>,
-        array: &dyn Array,
-        i: usize,
-    ) -> Result<Value<'a>, Error> {
-        // decimal type by default
-        let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-        let string = std::str::from_utf8(array.value(i))?;
-        bigdecimal.call((string,))
+        _values: &Vec<Value<'a>>,
+    ) -> Option<Result<ArrayRef>> {
+        None
     }
 
     fn build_array<'a>(
@@ -177,6 +184,10 @@ pub trait Converter {
         ctx: &Ctx<'a>,
         values: Vec<Value<'a>>,
     ) -> Result<ArrayRef> {
+        if let Some(result) = self.custom_build_array(data_type, ctx, &values) {
+            return result;
+        }
+
         match data_type {
             DataType::Null => build_array!(NullBuilder, ctx, values),
             DataType::Boolean => build_array!(BooleanBuilder, ctx, values),
@@ -194,9 +205,39 @@ pub trait Converter {
             DataType::Binary => build_array!(BinaryBuilder, Vec::<u8>, ctx, values),
             // TODO: add conversion overloads here
             // json type
-            DataType::LargeUtf8 => self.build_large_utf8_array(ctx, values),
-            // decimal type or Databend JSON type
-            DataType::LargeBinary => self.build_large_binary_array(ctx, values),
+            DataType::LargeUtf8 => {
+                let mut builder = LargeStringBuilder::with_capacity(values.len(), 1024);
+                for val in values {
+                    if val.is_null() || val.is_undefined() {
+                        builder.append_null();
+                    } else if let Some(s) = ctx.json_stringify(val)? {
+                        builder.append_value(s.to_string()?);
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            },
+            // decimal type
+            DataType::LargeBinary => {
+                let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 1024);
+                let bigdecimal_to_string: Function = ctx
+                    .eval("BigDecimal.prototype.toString")
+                    .context("failed to get BigDecimal.prototype.string")?;
+                for val in values {
+                    if val.is_null() || val.is_undefined() {
+                        builder.append_null();
+                    } else {
+                        let mut args = Args::new(ctx.clone(), 0);
+                        args.this(val)?;
+                        let string: String = bigdecimal_to_string.call_arg(args).context(
+                            "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
+                            )?;
+                        builder.append_value(string);
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            },
             // list
             DataType::List(inner) => {
                 // flatten lists
@@ -253,50 +294,9 @@ pub trait Converter {
             _ => todo!(),
         }
     }
-
-    // TODO: fix these so they match the original implementation
-    fn build_large_utf8_array<'a>(
-        &self,
-        ctx: &Ctx<'a>,
-        values: Vec<Value<'a>>,
-    ) -> Result<ArrayRef> {
-        let mut builder = LargeStringBuilder::with_capacity(values.len(), 1024);
-        for val in values {
-            if val.is_null() || val.is_undefined() {
-                builder.append_null();
-            } else if let Some(s) = ctx.json_stringify(val)? {
-                builder.append_value(s.to_string()?);
-            } else {
-                builder.append_null();
-            }
-        }
-        Ok(Arc::new(builder.finish()))
-    }
-
-    fn build_large_binary_array<'a>(
-        &self,
-        ctx: &Ctx<'a>,
-        values: Vec<Value<'a>>,
-    ) -> Result<ArrayRef> {
-        let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 1024);
-        let bigdecimal_to_string: Function = ctx
-            .eval("BigDecimal.prototype.toString")
-            .context("failed to get BigDecimal.prototype.string")?;
-        for val in values {
-            if val.is_null() || val.is_undefined() {
-                builder.append_null();
-            } else {
-                let mut args = Args::new(ctx.clone(), 0);
-                args.this(val)?;
-                let string: String = bigdecimal_to_string.call_arg(args).context(
-                    "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
-                    )?;
-                builder.append_value(string);
-            }
-        }
-        Ok(Arc::new(builder.finish()))
-    }
 }
 
 pub struct DefaultConverter{}
+
+// TODO try simplifying to just a single override for each direction
 impl Converter for DefaultConverter {}

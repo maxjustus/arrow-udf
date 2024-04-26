@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
 use arrow_array::{builder::Int32Builder, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use jsarrow::{Converter};
+use jsarrow::Converter;
 use rquickjs::{
     function::Args,
     Context, Ctx, Object, Persistent, Value,
@@ -94,6 +94,7 @@ impl Runtime<'_> {
             _runtime: runtime,
             converter: Converter{
                 large_utf8_to_jsvalue: None,
+                large_binary_to_jsvalue: None,
             },
             context,
         })
@@ -107,9 +108,8 @@ impl Runtime<'_> {
         mode: CallMode,
         code: &str,
     ) -> Result<()> {
-        self.converter.large_utf8_to_jsvalue = Some(|ctx, bigdecimal, array, idx| {
-            let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            ctx.json_parse(array.value(i))
+        self.converter.large_utf8_to_jsvalue = Some(|ctx, _bigdecimal, array, idx| {
+            ctx.json_parse(array.value(idx))
         });
         self.add_function_with_handler(name, return_type, mode, code, name)
     }

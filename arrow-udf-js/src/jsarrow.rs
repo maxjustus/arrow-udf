@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use arrow_array::{array::*, builder::*};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::DataType;
+use arrow_array::types::{GenericStringType, GenericBinaryType};
 use rquickjs::{Ctx, FromJs, Error, IntoJs, Function, Object, TypedArray, Value};
 use rquickjs::function::Args;
 use std::sync::Arc;
@@ -79,19 +80,19 @@ macro_rules! build_array {
 // another would be to pass the conversion functions directly.
 // passing directly could work in a way where the passed functions are first
 // line of defense and the default converter is used as a fallback.
-pub trait Converter {
-    fn custom_get_jsvalue<'a>(
-        &self,
-        _ctx: &Ctx<'a>,
-        _bigdecimal: &rquickjs::Function<'a>,
-        _array: &dyn Array,
-        _i: usize,
-    ) -> Option<Result<Value<'a>, Error>> {
-        None
-    }
 
+type ConverterCallback<'a, T> = Option<fn(&Ctx<'a>, &rquickjs::Function<'a>, &T, usize) -> Result<Value<'a>, Error>>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Converter<'a>{
+    pub large_utf8_to_jsvalue: ConverterCallback<'a, GenericByteArray<GenericStringType<i64>>>,
+    pub large_binary_to_jsvalue: ConverterCallback<'a, GenericByteArray<GenericBinaryType<i64>>>,
+}
+
+// TODO try simplifying to just a single override for each direction
+impl Converter<'_> {
     /// Get array element as a JS Value.
-    fn get_jsvalue<'a>(
+    pub fn get_jsvalue<'a>(
         &self,
         ctx: &Ctx<'a>,
         bigdecimal: &rquickjs::Function<'a>,
@@ -100,10 +101,6 @@ pub trait Converter {
     ) -> Result<Value<'a>, Error> {
         if array.is_null(i) {
             return Ok(Value::new_null(ctx.clone()));
-        }
-
-        if let Some(result) = self.custom_get_jsvalue(ctx, bigdecimal, array, i) {
-            return result;
         }
 
         match array.data_type() {
@@ -178,7 +175,7 @@ pub trait Converter {
         None
     }
 
-    fn build_array<'a>(
+    pub fn build_array<'a>(
         &self,
         data_type: &DataType,
         ctx: &Ctx<'a>,
@@ -295,8 +292,3 @@ pub trait Converter {
         }
     }
 }
-
-pub struct DefaultConverter{}
-
-// TODO try simplifying to just a single override for each direction
-impl Converter for DefaultConverter {}

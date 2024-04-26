@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
 use arrow_array::{builder::Int32Builder, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use jsarrow::{Converter, DefaultConverter};
+use jsarrow::{Converter};
 use rquickjs::{
     function::Args,
     Context, Ctx, Object, Persistent, Value,
@@ -32,17 +32,17 @@ use rquickjs::context::intrinsic::All;
 pub mod jsarrow;
 
 /// The JS UDF runtime.
-pub struct Runtime {
+pub struct Runtime<'a> {
     functions: HashMap<String, Function>,
     /// The `BigDecimal` constructor.
     bigdecimal: Persistent<rquickjs::Function<'static>>,
     // NOTE: `functions` and `bigdecimal` must be put before the runtime and context to be dropped first.
     _runtime: rquickjs::Runtime,
-    converter: Arc<dyn Converter>,
+    converter: Converter<'a>,
     context: Context,
 }
 
-impl Debug for Runtime {
+impl Debug for Runtime<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Runtime")
             .field("functions", &self.functions.keys())
@@ -58,8 +58,8 @@ struct Function {
 }
 
 // SAFETY: `rquickjs::Runtime` is `Send` and `Sync`
-unsafe impl Send for Runtime {}
-unsafe impl Sync for Runtime {}
+unsafe impl Send for Runtime<'_> {}
+unsafe impl Sync for Runtime<'_> {}
 
 /// Whether the function will be called when some of its arguments are null.
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -75,7 +75,7 @@ pub enum CallMode {
     ReturnNullOnNullInput,
 }
 
-impl Runtime {
+impl Runtime<'_> {
     /// Create a new JS UDF runtime from a JS code.
     pub fn new() -> Result<Self> {
         let runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
@@ -92,13 +92,11 @@ impl Runtime {
             functions: HashMap::new(),
             bigdecimal,
             _runtime: runtime,
-            converter: Arc::new(DefaultConverter{}),
+            converter: Converter{
+                large_utf8_to_jsvalue: None,
+            },
             context,
         })
-    }
-
-    pub fn set_custom_converter(&mut self, converter: Arc<dyn Converter>) {
-        self.converter = converter;
     }
 
     /// Add a JS function.
@@ -109,6 +107,10 @@ impl Runtime {
         mode: CallMode,
         code: &str,
     ) -> Result<()> {
+        self.converter.large_utf8_to_jsvalue = Some(|ctx, bigdecimal, array, idx| {
+            let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            ctx.json_parse(array.value(i))
+        });
         self.add_function_with_handler(name, return_type, mode, code, name)
     }
 
@@ -200,6 +202,7 @@ impl Runtime {
                 Field::new("row", DataType::Int32, true),
                 Field::new(name, function.return_type.clone(), true),
             ])),
+            converter: self.converter.clone(),
             chunk_size,
             row: 0,
             generator: None,
@@ -215,6 +218,7 @@ pub struct RecordBatchIter<'a> {
     input: &'a RecordBatch,
     function: &'a Function,
     schema: SchemaRef,
+    converter: Converter<'a>,
     chunk_size: usize,
     // mutable states
     /// Current row index.
@@ -238,7 +242,6 @@ impl RecordBatchIter<'_> {
         }
         self.context.with(|ctx| {
             let bigdecimal = self.bigdecimal.clone().restore(&ctx)?;
-            let converter = DefaultConverter{};
             let js_function = self.function.function.clone().restore(&ctx)?;
             let mut indexes = Int32Builder::with_capacity(self.chunk_size);
             let mut results = Vec::with_capacity(self.input.num_rows());
@@ -260,7 +263,7 @@ impl RecordBatchIter<'_> {
                     // call the table function to get a generator
                     row.clear();
                     for column in self.input.columns() {
-                        let val = converter.get_jsvalue(&ctx, &bigdecimal, column, self.row)
+                        let val = self.converter.get_jsvalue(&ctx, &bigdecimal, column, self.row)
                             .context("failed to get jsvalue from arrow array")?;
                         row.push(val);
                     }
@@ -305,7 +308,7 @@ impl RecordBatchIter<'_> {
                 return Ok(None);
             }
             let indexes = Arc::new(indexes.finish());
-            let array = converter.build_array(&self.function.return_type, &ctx, results)
+            let array = self.converter.build_array(&self.function.return_type, &ctx, results)
                 .context("failed to build arrow array from return values")?;
             Ok(Some(RecordBatch::try_new(
                 self.schema.clone(),

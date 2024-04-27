@@ -15,10 +15,9 @@
 //! Convert arrow array from/to js objects.
 
 use anyhow::{Context, Result};
-use arrow_array::{array::*, builder::*};
-use arrow_buffer::OffsetBuffer;
+use arrow_array::{array::*, builder::*, ArrowNativeTypeOp};
+use arrow_buffer::{OffsetBuffer, i256};
 use arrow_schema::DataType;
-use arrow_array::types::{GenericStringType, GenericBinaryType};
 use rquickjs::{Ctx, FromJs, Error, IntoJs, Function, Object, TypedArray, Value};
 use rquickjs::function::Args;
 use std::sync::Arc;
@@ -75,22 +74,41 @@ macro_rules! build_array {
     }};
 }
 
-// one approach is to use a trait to convert arrow array to JS value
-// and pass the converter to the new function for a JS Runtime
-// another would be to pass the conversion functions directly.
-// passing directly could work in a way where the passed functions are first
-// line of defense and the default converter is used as a fallback.
-
-type ConverterCallback<'a, T> = Option<fn(&Ctx<'a>, &rquickjs::Function<'a>, &T, usize) -> Result<Value<'a>, Error>>;
-
-#[derive(Debug, Clone, Copy)]
-pub struct Converter<'a>{
-    pub large_utf8_to_jsvalue: ConverterCallback<'a, GenericByteArray<GenericStringType<i64>>>,
-    pub large_binary_to_jsvalue: ConverterCallback<'a, GenericByteArray<GenericBinaryType<i64>>>,
+macro_rules! build_json_array {
+    ($array_type: ty, $ctx:expr, $values:expr) => {{
+        let mut builder = <$array_type>::with_capacity($values.len(), 1024);
+        for val in $values {
+            if val.is_null() || val.is_undefined() {
+                builder.append_null();
+            } else if let Some(s) = $ctx.json_stringify(val)? {
+                builder.append_value(s.to_string()?);
+            } else {
+                builder.append_null();
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }};
 }
 
-// TODO try simplifying to just a single override for each direction
-impl Converter<'_> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LargeUtf8ConvertedType {
+    JSON,
+    String
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LargeBinaryConvertedType {
+    JSON,
+    Decimal
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Converter{
+    pub large_utf8_conversion_type: LargeUtf8ConvertedType,
+    pub large_binary_conversion_type: LargeBinaryConvertedType,
+}
+
+impl Converter {
     /// Get array element as a JS Value.
     pub fn get_jsvalue<'a>(
         &self,
@@ -118,16 +136,41 @@ impl Converter<'_> {
             DataType::Float64 => get_jsvalue!(Float64Array, ctx, array, i),
             DataType::Utf8 => get_jsvalue!(StringArray, ctx, array, i),
             DataType::Binary => get_jsvalue!(BinaryArray, ctx, array, i),
-            // json type
             DataType::LargeUtf8 => {
-                let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                ctx.json_parse(array.value(i))
+                match self.large_utf8_conversion_type {
+                    LargeUtf8ConvertedType::JSON => {
+                        let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                        let string = array.value(i);
+                        ctx.json_parse(string)
+                    },
+                    LargeUtf8ConvertedType::String=> {
+                        get_jsvalue!(LargeStringArray, ctx, array, i)
+                    }
+                }
             },
             // decimal type
             DataType::LargeBinary => {
                 let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
                 let string = std::str::from_utf8(array.value(i))?;
-                bigdecimal.call((string,))
+
+                match self.large_binary_conversion_type {
+                    LargeBinaryConvertedType::JSON => {
+                        ctx.json_parse(string)
+                    },
+                    LargeBinaryConvertedType::Decimal => {
+                        bigdecimal.call((string,))
+                    }
+                }
+            },
+            DataType::Decimal128(_, _) => {
+                let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                let decimal_str = array.value_as_string(i);
+                bigdecimal.call((decimal_str,))
+            },
+            DataType::Decimal256(_, _) => {
+                let array = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+                let decimal_str = array.value_as_string(i);
+                bigdecimal.call((decimal_str,))
             },
             // list
             DataType::List(inner) => {
@@ -166,25 +209,12 @@ impl Converter<'_> {
         }
     }
 
-    fn custom_build_array<'a>(
-        &self,
-        _data_type: &DataType,
-        _ctx: &Ctx<'a>,
-        _values: &Vec<Value<'a>>,
-    ) -> Option<Result<ArrayRef>> {
-        None
-    }
-
     pub fn build_array<'a>(
         &self,
         data_type: &DataType,
         ctx: &Ctx<'a>,
         values: Vec<Value<'a>>,
     ) -> Result<ArrayRef> {
-        if let Some(result) = self.custom_build_array(data_type, ctx, &values) {
-            return result;
-        }
-
         match data_type {
             DataType::Null => build_array!(NullBuilder, ctx, values),
             DataType::Boolean => build_array!(BooleanBuilder, ctx, values),
@@ -200,27 +230,52 @@ impl Converter<'_> {
             DataType::Float64 => build_array!(Float64Builder, ctx, values),
             DataType::Utf8 => build_array!(StringBuilder, String, ctx, values),
             DataType::Binary => build_array!(BinaryBuilder, Vec::<u8>, ctx, values),
-            // TODO: add conversion overloads here
             // json type
             DataType::LargeUtf8 => {
-                let mut builder = LargeStringBuilder::with_capacity(values.len(), 1024);
-                for val in values {
-                    if val.is_null() || val.is_undefined() {
-                        builder.append_null();
-                    } else if let Some(s) = ctx.json_stringify(val)? {
-                        builder.append_value(s.to_string()?);
-                    } else {
-                        builder.append_null();
+                match self.large_utf8_conversion_type {
+                    LargeUtf8ConvertedType::JSON => {
+                        build_json_array!(LargeStringBuilder, ctx, values)
+                    },
+                    LargeUtf8ConvertedType::String => {
+                        build_array!(LargeStringBuilder, String, ctx, values)
                     }
                 }
-                Ok(Arc::new(builder.finish()))
             },
             // decimal type
             DataType::LargeBinary => {
-                let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 1024);
+                match self.large_binary_conversion_type {
+                    LargeBinaryConvertedType::JSON => {
+                        build_json_array!(LargeBinaryBuilder, ctx, values)
+                    },
+                    LargeBinaryConvertedType::Decimal => {
+                        let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 1024);
+                        let bigdecimal_to_string: Function = ctx
+                            .eval("BigDecimal.prototype.toString")
+                            .context("failed to get BigDecimal.prototype.string")?;
+                        for val in values {
+                            if val.is_null() || val.is_undefined() {
+                                builder.append_null();
+                            } else {
+                                let mut args = Args::new(ctx.clone(), 0);
+                                args.this(val)?;
+                                let string: String = bigdecimal_to_string.call_arg(args).context(
+                                    "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
+                                    )?;
+                                builder.append_value(string);
+                            }
+                        }
+                        Ok(Arc::new(builder.finish()))
+                    }
+                }
+            },
+            DataType::Decimal128(precision, scale) => {
+                let mut builder = Decimal128Builder::with_capacity(values.len())
+                    .with_precision_and_scale(*precision, *scale)?;
+
                 let bigdecimal_to_string: Function = ctx
                     .eval("BigDecimal.prototype.toString")
                     .context("failed to get BigDecimal.prototype.string")?;
+
                 for val in values {
                     if val.is_null() || val.is_undefined() {
                         builder.append_null();
@@ -230,7 +285,33 @@ impl Converter<'_> {
                         let string: String = bigdecimal_to_string.call_arg(args).context(
                             "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
                             )?;
-                        builder.append_value(string);
+                        let decimal_integer = decimal_string_to_i256(&string, *scale)?
+                            .to_i128()
+                            .ok_or_else(|| anyhow::anyhow!("failed to convert to i128"))?;
+                        builder.append_value(decimal_integer);
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            },
+            DataType::Decimal256(precision, scale) => {
+                let mut builder = Decimal256Builder::with_capacity(values.len())
+                    .with_precision_and_scale(*precision, *scale)?;
+
+                let bigdecimal_to_string: Function = ctx
+                    .eval("BigDecimal.prototype.toString")
+                    .context("failed to get BigDecimal.prototype.string")?;
+
+                for val in values {
+                    if val.is_null() || val.is_undefined() {
+                        builder.append_null();
+                    } else {
+                        let mut args = Args::new(ctx.clone(), 0);
+                        args.this(val)?;
+                        let string: String = bigdecimal_to_string.call_arg(args).context(
+                            "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
+                            )?;
+                        let decimal_integer = decimal_string_to_i256(&string, *scale)?;
+                        builder.append_value(decimal_integer);
                     }
                 }
                 Ok(Arc::new(builder.finish()))
@@ -291,4 +372,20 @@ impl Converter<'_> {
             _ => todo!(),
         }
     }
+}
+
+fn decimal_string_to_i256(s: &str, scale: i8) -> Result<i256> {
+    if scale < 0 {
+        return Err(anyhow::anyhow!("currently only supports non-negative scale"));
+    }
+
+   let parts = s.split('.').collect::<Vec<&str>>();
+   let integer = i256::from_string(parts[0]).ok_or_else(|| anyhow::anyhow!("failed to parse integer part"))?;
+   let fractional = if parts.len() == 1 {
+       i256::ZERO
+   } else {
+       i256::from_string(parts[1]).ok_or_else(|| anyhow::anyhow!("failed to parse fractional part"))?
+   };
+
+   Ok((integer * i256::from_i128(10).pow_checked(scale as u32)?) + fractional)
 }

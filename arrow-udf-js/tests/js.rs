@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{sync::Arc, io::Read};
 
 use arrow_array::{
-    types::*, ArrayRef, BinaryArray, Int32Array, LargeBinaryArray, LargeStringArray, ListArray,
+    types::*, ArrayRef, BinaryArray, Int32Array, LargeBinaryArray, LargeStringArray, ListArray, Decimal128Array, Decimal256Array,
     RecordBatch, StringArray, StructArray,
 };
 use arrow_cast::pretty::pretty_format_batches;
+use arrow_buffer::i256;
 use arrow_schema::{DataType, Field, Schema};
 use arrow_udf_js::{CallMode, Runtime};
 use expect_test::{expect, Expect};
@@ -211,6 +212,155 @@ fn test_json_stringify() {
         | json_stringify |
         +----------------+
         | [1,null,""]    |
+        +----------------+"#]],
+    );
+}
+
+#[test]
+fn test_large_binary_json_stringify() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "json_stringify",
+            DataType::LargeBinary,
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function json_stringify(object) {
+                return JSON.stringify(object);
+            }
+            "#,
+        )
+        .unwrap();
+
+    runtime.treat_large_binary_as_json();
+
+    let schema = Schema::new(vec![Field::new("json", DataType::LargeBinary, true)]);
+    let arg0 = LargeBinaryArray::from(vec![(r#"[1, null, ""]"#).as_bytes()]);
+    let input = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arg0)]).unwrap();
+
+    let output = runtime.call("json_stringify", &input).unwrap();
+    let row = output.column(0).as_any().downcast_ref::<LargeBinaryArray>().unwrap().value(0);
+    assert_eq!(std::str::from_utf8(row).unwrap(), r#""[1,null,\"\"]""#);
+}
+
+#[test]
+fn test_large_string_as_string() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "string_length",
+            DataType::LargeUtf8,
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function string_length(s) {
+                return "string length is " + s.length;
+            }
+            "#,
+        )
+        .unwrap();
+
+    runtime.treat_large_utf8_as_string();
+
+    let schema = Schema::new(vec![Field::new("s", DataType::LargeUtf8, true)]);
+    let arg0 = LargeStringArray::from(vec![r#"hello"#]);
+    let input = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arg0)]).unwrap();
+
+    let output = runtime.call("string_length", &input).unwrap();
+    check(
+        &[output],
+        expect![[r#"
+        +--------------------+
+        | string_length      |
+        +--------------------+
+        | string length is 5 |
+        +--------------------+"#]],
+    );
+}
+
+#[test]
+fn test_decimal128() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "decimal128_add",
+            DataType::Decimal128(19, 2),
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function decimal128_add(a, b) {
+                return a + b;
+            }
+            "#,
+        )
+        .unwrap();
+
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Decimal128(19, 2), true),
+        Field::new("b", DataType::Decimal128(19, 2), true),
+    ]);
+    let arg0 = Decimal128Array::from(vec![Some(100), None])
+        .with_precision_and_scale(19, 2)
+        .unwrap();
+    let arg1 = Decimal128Array::from(vec![Some(201), None])
+        .with_precision_and_scale(19, 2)
+        .unwrap();
+    let input =
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arg0), Arc::new(arg1)]).unwrap();
+
+    let output = runtime.call("decimal128_add", &input).unwrap();
+    check(
+        &[output],
+        expect![[r#"
+        +----------------+
+        | decimal128_add |
+        +----------------+
+        | 3.01           |
+        |                |
+        +----------------+"#]],
+    );
+}
+
+#[test]
+fn test_decimal256() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "decimal256_add",
+            DataType::Decimal256(19, 2),
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function decimal256_add(a, b) {
+                return a + b;
+            }
+            "#,
+        )
+        .unwrap();
+
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Decimal256(19, 2), true),
+        Field::new("b", DataType::Decimal256(19, 2), true),
+    ]);
+    let arg0 = Decimal256Array::from(vec![Some(i256::from(100)), None])
+        .with_precision_and_scale(19, 2)
+        .unwrap();
+    let arg1 = Decimal256Array::from(vec![Some(i256::from(201)), None])
+        .with_precision_and_scale(19, 2)
+        .unwrap();
+    let input =
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arg0), Arc::new(arg1)]).unwrap();
+
+    let output = runtime.call("decimal256_add", &input).unwrap();
+    check(
+        &[output],
+        expect![[r#"
+        +----------------+
+        | decimal256_add |
+        +----------------+
+        | 3.01           |
+        |                |
         +----------------+"#]],
     );
 }

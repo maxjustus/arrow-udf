@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
 use arrow_array::{builder::Int32Builder, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use jsarrow::Converter;
+use jsarrow::{Converter, LargeUtf8ConvertedType, LargeBinaryConvertedType};
 use rquickjs::{
     function::Args,
     Context, Ctx, Object, Persistent, Value,
@@ -32,17 +32,17 @@ use rquickjs::context::intrinsic::All;
 pub mod jsarrow;
 
 /// The JS UDF runtime.
-pub struct Runtime<'a> {
+pub struct Runtime {
     functions: HashMap<String, Function>,
     /// The `BigDecimal` constructor.
     bigdecimal: Persistent<rquickjs::Function<'static>>,
     // NOTE: `functions` and `bigdecimal` must be put before the runtime and context to be dropped first.
     _runtime: rquickjs::Runtime,
-    converter: Converter<'a>,
+    converter: Converter,
     context: Context,
 }
 
-impl Debug for Runtime<'_> {
+impl Debug for Runtime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Runtime")
             .field("functions", &self.functions.keys())
@@ -58,8 +58,8 @@ struct Function {
 }
 
 // SAFETY: `rquickjs::Runtime` is `Send` and `Sync`
-unsafe impl Send for Runtime<'_> {}
-unsafe impl Sync for Runtime<'_> {}
+unsafe impl Send for Runtime {}
+unsafe impl Sync for Runtime {}
 
 /// Whether the function will be called when some of its arguments are null.
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -75,7 +75,7 @@ pub enum CallMode {
     ReturnNullOnNullInput,
 }
 
-impl Runtime<'_> {
+impl Runtime {
     /// Create a new JS UDF runtime from a JS code.
     pub fn new() -> Result<Self> {
         let runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
@@ -93,11 +93,27 @@ impl Runtime<'_> {
             bigdecimal,
             _runtime: runtime,
             converter: Converter{
-                large_utf8_to_jsvalue: None,
-                large_binary_to_jsvalue: None,
+                large_utf8_conversion_type: LargeUtf8ConvertedType::JSON,
+                large_binary_conversion_type: LargeBinaryConvertedType::Decimal,
             },
             context,
         })
+    }
+
+    pub fn treat_large_utf8_as_json(&mut self) {
+        self.converter.large_utf8_conversion_type = LargeUtf8ConvertedType::JSON;
+    }
+
+    pub fn treat_large_utf8_as_string(&mut self) {
+        self.converter.large_utf8_conversion_type = LargeUtf8ConvertedType::String;
+    }
+
+    pub fn treat_large_binary_as_decimal(&mut self) {
+        self.converter.large_binary_conversion_type = LargeBinaryConvertedType::Decimal;
+    }
+
+    pub fn treat_large_binary_as_json(&mut self) {
+        self.converter.large_binary_conversion_type = LargeBinaryConvertedType::JSON;
     }
 
     /// Add a JS function.
@@ -108,9 +124,6 @@ impl Runtime<'_> {
         mode: CallMode,
         code: &str,
     ) -> Result<()> {
-        self.converter.large_utf8_to_jsvalue = Some(|ctx, _bigdecimal, array, idx| {
-            ctx.json_parse(array.value(idx))
-        });
         self.add_function_with_handler(name, return_type, mode, code, name)
     }
 
@@ -218,7 +231,7 @@ pub struct RecordBatchIter<'a> {
     input: &'a RecordBatch,
     function: &'a Function,
     schema: SchemaRef,
-    converter: Converter<'a>,
+    converter: Converter,
     chunk_size: usize,
     // mutable states
     /// Current row index.

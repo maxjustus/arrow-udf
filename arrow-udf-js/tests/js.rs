@@ -222,12 +222,13 @@ fn test_large_binary_json_stringify() {
 
     runtime
         .add_function(
-            "json_stringify",
+            "add_element",
             large_binary_json_field("object"),
             CallMode::ReturnNullOnNullInput,
             r#"
-            export function json_stringify(object) {
-                return JSON.stringify(object);
+            export function add_element(object) {
+                object.push(10);
+                return object;
             }
             "#,
         )
@@ -237,9 +238,9 @@ fn test_large_binary_json_stringify() {
     let arg0 = LargeBinaryArray::from(vec![(r#"[1, null, ""]"#).as_bytes()]);
     let input = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arg0)]).unwrap();
 
-    let output = runtime.call("json_stringify", &input).unwrap();
+    let output = runtime.call("add_element", &input).unwrap();
     let row = output.column(0).as_any().downcast_ref::<LargeBinaryArray>().unwrap().value(0);
-    assert_eq!(std::str::from_utf8(row).unwrap(), r#""[1,null,\"\"]""#);
+    assert_eq!(std::str::from_utf8(row).unwrap(), r#"[1,null,"",10]"#);
 }
 
 #[test]
@@ -652,7 +653,7 @@ fn json_field(name: &str) -> Field {
 
 fn large_binary_json_field(name: &str) -> Field {
     Field::new(name, DataType::LargeBinary, true)
-        .with_metadata([("ARROW:extension:name".into(), "Variant".into())].into())
+        .with_metadata([("ARROW:extension:name".into(), "arrowudf.json".into())].into())
 }
 
 /// Returns a field with decimal type.

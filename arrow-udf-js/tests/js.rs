@@ -15,11 +15,13 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    types::*, ArrayRef, BinaryArray, Int32Array, LargeBinaryArray, LargeStringArray, ListArray, Decimal128Array, Decimal256Array,
-    RecordBatch, StringArray, StructArray,
+    types::*, ArrayRef, BinaryArray, Date32Array, Decimal128Array, Decimal256Array, Int32Array,
+    LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
-use arrow_cast::pretty::pretty_format_batches;
 use arrow_buffer::i256;
+use arrow_cast::pretty::pretty_format_batches;
 use arrow_schema::{DataType, Field, Schema};
 use arrow_udf_js::{CallMode, Runtime};
 use expect_test::{expect, Expect};
@@ -239,7 +241,12 @@ fn test_large_binary_json_stringify() {
     let input = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arg0)]).unwrap();
 
     let output = runtime.call("add_element", &input).unwrap();
-    let row = output.column(0).as_any().downcast_ref::<LargeBinaryArray>().unwrap().value(0);
+    let row = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap()
+        .value(0);
     assert_eq!(std::str::from_utf8(row).unwrap(), r#"[1,null,"",10]"#);
 }
 
@@ -287,7 +294,7 @@ fn test_decimal128() {
             CallMode::ReturnNullOnNullInput,
             r#"
             export function decimal128_add(a, b) {
-                return a + b;
+                return a + b + BigDecimal('0.000001');
             }
             "#,
         )
@@ -330,7 +337,7 @@ fn test_decimal256() {
             CallMode::ReturnNullOnNullInput,
             r#"
             export function decimal256_add(a, b) {
-                return a + b;
+                return a + b + BigDecimal('0.000001');
             }
             "#,
         )
@@ -394,6 +401,197 @@ fn test_decimal_add() {
             +--------+
             | 0.0003 |
             +--------+"#]],
+    );
+}
+
+#[test]
+fn test_timestamp_second_array() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "timestamp_array",
+            DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function timestamp_array(a) {
+                return a;
+            }
+            "#,
+        )
+        .unwrap();
+
+    let schema = Schema::new(vec![Field::new(
+        "x",
+        DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+        true,
+    )]);
+    let arg0 = TimestampSecondArray::from(vec![Some(1), None, Some(3)]);
+    let input = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arg0)]).unwrap();
+
+    let output = runtime.call("timestamp_array", &input).unwrap();
+    check(
+        &[output],
+        expect![[r#"
+        +---------------------+
+        | timestamp_array     |
+        +---------------------+
+        | 1970-01-01T00:00:01 |
+        |                     |
+        | 1970-01-01T00:00:03 |
+        +---------------------+"#]],
+    );
+}
+
+#[test]
+fn test_timestamp_millisecond_array() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "timestamp_array",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function timestamp_array(a) {
+                return a;
+            }
+            "#,
+        )
+        .unwrap();
+
+    let schema = Schema::new(vec![Field::new(
+        "x",
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+        true,
+    )]);
+    let arg0 = TimestampMillisecondArray::from(vec![Some(1000), None, Some(3000)]);
+    let input = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arg0)]).unwrap();
+
+    let output = runtime.call("timestamp_array", &input).unwrap();
+    check(
+        &[output],
+        expect![[r#"
+        +---------------------+
+        | timestamp_array     |
+        +---------------------+
+        | 1970-01-01T00:00:01 |
+        |                     |
+        | 1970-01-01T00:00:03 |
+        +---------------------+"#]],
+    );
+}
+
+#[test]
+fn test_timestamp_microsecond_array() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "timestamp_array",
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function timestamp_array(a) {
+                return a;
+            }
+            "#,
+        )
+        .unwrap();
+
+    let schema = Schema::new(vec![Field::new(
+        "x",
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        true,
+    )]);
+    let arg0 = TimestampMicrosecondArray::from(vec![Some(1000000), None, Some(3000000)]);
+    let input = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arg0)]).unwrap();
+
+    let output = runtime.call("timestamp_array", &input).unwrap();
+    check(
+        &[output],
+        expect![[r#"
+        +---------------------+
+        | timestamp_array     |
+        +---------------------+
+        | 1970-01-01T00:00:01 |
+        |                     |
+        | 1970-01-01T00:00:03 |
+        +---------------------+"#]],
+    );
+}
+
+#[test]
+fn test_timestamp_nanosecond_array() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "timestamp_array",
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function timestamp_array(a) {
+                return a;
+            }
+            "#,
+        )
+        .unwrap();
+
+    let schema = Schema::new(vec![Field::new(
+        "x",
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+        true,
+    )]);
+    let arg0 = TimestampNanosecondArray::from(vec![Some(1000000), None, Some(3000000)]);
+    let input = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arg0)]).unwrap();
+
+    let output = runtime.call("timestamp_array", &input).unwrap();
+    check(
+        &[output],
+        expect![[r#"
+        +-------------------------+
+        | timestamp_array         |
+        +-------------------------+
+        | 1970-01-01T00:00:00.001 |
+        |                         |
+        | 1970-01-01T00:00:00.003 |
+        +-------------------------+"#]],
+    );
+}
+
+#[test]
+fn test_date32_array() {
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime
+        .add_function(
+            "date_array",
+            DataType::Date32,
+            CallMode::ReturnNullOnNullInput,
+            r#"
+            export function date_array(a) {
+                return a;
+            }
+            "#,
+        )
+        .unwrap();
+
+    let schema = Schema::new(vec![Field::new("x", DataType::Date32, true)]);
+    let arg0 = Date32Array::from(vec![Some(1), None, Some(3)]);
+    let input = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arg0)]).unwrap();
+
+    let output = runtime.call("date_array", &input).unwrap();
+    check(
+        &[output],
+        expect![[r#"
+        +------------+
+        | date_array |
+        +------------+
+        | 1970-01-02 |
+        |            |
+        | 1970-01-04 |
+        +------------+"#]],
     );
 }
 

@@ -21,11 +21,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
 use arrow_array::{builder::Int32Builder, RecordBatch};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
-use rquickjs::{
-    function::Args,
-    Context, Ctx, Object, Persistent, Value,
-};
 use rquickjs::context::intrinsic::All;
+use rquickjs::{function::Args, Context, Ctx, Object, Persistent, Value};
 
 use self::into_field::IntoField;
 
@@ -80,15 +77,13 @@ impl Runtime {
     /// Create a new JS UDF runtime from a JS code.
     pub fn new() -> Result<Self> {
         let runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
-        let context =
-            rquickjs::Context::custom::<All>(
-                &runtime,
-            )
+        let context = rquickjs::Context::custom::<All>(&runtime)
             .context("failed to create quickjs context")?;
         let bigdecimal = context.with(|ctx| {
             let bigdecimal: rquickjs::Function = ctx.eval("BigDecimal")?;
             Ok(Persistent::save(&ctx, bigdecimal)) as Result<_>
         })?;
+
         Ok(Self {
             functions: HashMap::new(),
             bigdecimal,
@@ -150,7 +145,9 @@ impl Runtime {
             for i in 0..input.num_rows() {
                 row.clear();
                 for (column, field) in input.columns().iter().zip(input.schema().fields()) {
-                    let val = self.converter.get_jsvalue(&ctx, &bigdecimal, field, column, i)
+                    let val = self
+                        .converter
+                        .get_jsvalue(&ctx, &bigdecimal, field, column, i)
                         .context("failed to get jsvalue from arrow array")?;
 
                     row.push(val);
@@ -170,7 +167,9 @@ impl Runtime {
                 results.push(result);
             }
 
-            let array = self.converter.build_array(&function.return_field, &ctx, results)
+            let array = self
+                .converter
+                .build_array(&function.return_field, &ctx, results)
                 .context("failed to build arrow array from return values")?;
             let schema = Schema::new(vec![function.return_field.clone()]);
             Ok(RecordBatch::try_new(Arc::new(schema), vec![array])?)
@@ -200,7 +199,7 @@ impl Runtime {
             chunk_size,
             row: 0,
             generator: None,
-            converter: self.converter.clone(),
+            converter: &self.converter,
         })
     }
 }
@@ -218,7 +217,7 @@ pub struct RecordBatchIter<'a> {
     row: usize,
     /// Generator of the current row.
     generator: Option<Persistent<Object<'static>>>,
-    converter: jsarrow::Converter,
+    converter: &'a jsarrow::Converter,
 }
 
 // XXX: not sure if this is safe.
@@ -259,7 +258,9 @@ impl RecordBatchIter<'_> {
                     for (column, field) in
                         (self.input.columns().iter()).zip(self.input.schema().fields())
                     {
-                        let val = self.converter.get_jsvalue(&ctx, &bigdecimal, field, column, self.row)
+                        let val = self
+                            .converter
+                            .get_jsvalue(&ctx, &bigdecimal, field, column, self.row)
                             .context("failed to get jsvalue from arrow array")?;
                         row.push(val);
                     }
@@ -304,7 +305,9 @@ impl RecordBatchIter<'_> {
                 return Ok(None);
             }
             let indexes = Arc::new(indexes.finish());
-            let array = self.converter.build_array(&self.function.return_field, &ctx, results)
+            let array = self
+                .converter
+                .build_array(&self.function.return_field, &ctx, results)
                 .context("failed to build arrow array from return values")?;
             Ok(Some(RecordBatch::try_new(
                 self.schema.clone(),

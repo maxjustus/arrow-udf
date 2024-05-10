@@ -16,15 +16,48 @@
 
 use anyhow::{Context, Result};
 use arrow_array::{array::*, builder::*, ArrowNativeTypeOp};
-use arrow_buffer::{OffsetBuffer, i256};
+use arrow_buffer::{i256, OffsetBuffer};
 use arrow_schema::{DataType, Field};
-use rquickjs::{function::Args, Ctx, Error, FromJs, Function, IntoJs, Object, TypedArray, Value};
+use rquickjs::{function::Args, function::Constructor, Ctx, Error, FromJs, Function, IntoJs, Object, TypedArray, Value};
 use std::sync::Arc;
 
 macro_rules! get_jsvalue {
     ($array_type: ty, $ctx:expr, $array:expr, $i:expr) => {{
         let array = $array.as_any().downcast_ref::<$array_type>().unwrap();
         array.value($i).into_js($ctx)
+    }};
+}
+
+macro_rules! get_date_ms_js_value {
+    ($array_type: ty, $ctx:expr, $array:expr, $i:expr) => {{
+        let array = $array.as_any().downcast_ref::<$array_type>().unwrap();
+        let date_constructor: Constructor = $ctx.globals().get("Date")?;
+        let date_ms = array.value_as_datetime($i)
+            .expect("failed to get date as datetime")
+            .and_utc()
+            .timestamp_millis();
+        date_constructor.construct((date_ms,))?
+    }}
+}
+
+macro_rules! build_timestamp_array {
+    ($builder_type: ty, $date_primitive_type:ty, $ctx:expr, $values:expr, $op:tt, $coeff:expr) => {{
+        let date_to_ms_epoch: Function = $ctx
+            .eval("(function(x) { return x.getTime() })")
+            .context("failed to get date to ms epoch function")?;
+
+        let mut builder = <$builder_type>::with_capacity($values.len());
+
+        for val in $values {
+            if val.is_null() || val.is_undefined() {
+                builder.append_null();
+            } else {
+                let date: i64 = date_to_ms_epoch.call((val,))?;
+                let date = date $op $coeff;
+                builder.append_value(date as $date_primitive_type);
+            }
+        }
+        Ok(Arc::new(builder.finish()))
     }};
 }
 
@@ -96,12 +129,10 @@ pub struct Converter {
     decimal_extension_name: String,
 }
 
+// TODO: should this be a trait so more is shared between various runtimes?
 impl Converter {
     pub fn new() -> Self {
         Self {
-            // k: Extension
-            // v: Variant
-            // for databend
             arrow_extension_key: "ARROW:extension:name".to_string(),
             json_extension_name: "arrowudf.json".to_string(),
             decimal_extension_name: "arrowudf.decimal".to_string(),
@@ -121,7 +152,6 @@ impl Converter {
     pub fn set_decimal_extension_name(&mut self, name: &str) {
         self.decimal_extension_name = name.to_string();
     }
-    // TODO move get_ methods in here.
 
     /// Get array element as a JS Value.
     pub fn get_jsvalue<'a>(
@@ -165,7 +195,7 @@ impl Converter {
                     }
                     _ => get_jsvalue!(StringArray, ctx, array, i),
                 }
-            },
+            }
             DataType::Binary => get_jsvalue!(BinaryArray, ctx, array, i),
             DataType::LargeUtf8 => get_jsvalue!(LargeStringArray, ctx, array, i),
             DataType::LargeBinary => match field
@@ -184,12 +214,33 @@ impl Converter {
                 let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
                 let decimal_str = array.value_as_string(i);
                 bigdecimal.call((decimal_str,))
-            },
+            }
             DataType::Decimal256(_, _) => {
                 let array = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
                 let decimal_str = array.value_as_string(i);
                 bigdecimal.call((decimal_str,))
-            },
+            }
+            // TODO: handle tz correctly. requires probably converting tz str into a Chrono Tz
+            DataType::Timestamp(unit, _tz) => {
+                match unit {
+                    // TODO: test this
+                    arrow_schema::TimeUnit::Second => {
+                        get_date_ms_js_value!(TimestampSecondArray, ctx, array, i)
+                    }
+                    arrow_schema::TimeUnit::Millisecond => {
+                        get_date_ms_js_value!(TimestampMillisecondArray, ctx, array, i)
+                    }
+                    arrow_schema::TimeUnit::Microsecond => {
+                        get_date_ms_js_value!(TimestampMicrosecondArray, ctx, array, i)
+                    }
+                    arrow_schema::TimeUnit::Nanosecond => {
+                        get_date_ms_js_value!(TimestampNanosecondArray, ctx, array, i)
+                    }
+                }
+            }
+            DataType::Date32 => {
+                get_date_ms_js_value!(Date32Array, ctx, array, i)
+            }
             // list
             DataType::List(inner) => {
                 let array = array.as_any().downcast_ref::<ListArray>().unwrap();
@@ -208,7 +259,13 @@ impl Converter {
                     _ => {
                         let mut values = Vec::with_capacity(list.len());
                         for j in 0..list.len() {
-                            values.push(self.get_jsvalue(ctx, bigdecimal, field, list.as_ref(), j)?);
+                            values.push(self.get_jsvalue(
+                                ctx,
+                                bigdecimal,
+                                field,
+                                list.as_ref(),
+                                j,
+                            )?);
                         }
                         values.into_js(ctx)
                     }
@@ -218,7 +275,13 @@ impl Converter {
                 let array = array.as_any().downcast_ref::<StructArray>().unwrap();
                 let object = Object::new(ctx.clone())?;
                 for (j, field) in fields.iter().enumerate() {
-                    let value = self.get_jsvalue(ctx, bigdecimal, field, array.column(j).as_ref(), i)?;
+                    let value = self.get_jsvalue(
+                        ctx,
+                        bigdecimal,
+                        field,
+                        array.column(j).as_ref(),
+                        i,
+                    )?;
                     object.set(field.name(), value)?;
                 }
                 Ok(object.into_value())
@@ -251,7 +314,9 @@ impl Converter {
                 .get(self.arrow_extension_key.as_str())
                 .map(|s| s.as_str())
             {
-                Some(x) if x == self.json_extension_name.as_str() =>  build_json_array!(StringBuilder, ctx, values),
+                Some(x) if x == self.json_extension_name.as_str() => {
+                    build_json_array!(StringBuilder, ctx, values)
+                }
                 Some(x) if x == self.decimal_extension_name.as_str() => {
                     let mut builder = StringBuilder::with_capacity(values.len(), 1024);
                     let bigdecimal_to_string: Function = ctx
@@ -278,24 +343,21 @@ impl Converter {
             },
             DataType::LargeUtf8 => build_array!(LargeStringBuilder, String, ctx, values),
             DataType::Binary => build_array!(BinaryBuilder, Vec::<u8>, ctx, values),
-            // decimal type
             DataType::LargeBinary => match field
                 .metadata()
                 .get(self.arrow_extension_key.as_str())
                 .map(|s| s.as_str())
             {
                 Some(x) if x == self.json_extension_name.as_str() => {
-                   build_json_array!(LargeBinaryBuilder, ctx, values)
+                    build_json_array!(LargeBinaryBuilder, ctx, values)
                 }
-                _ => build_array!(LargeBinaryBuilder, Vec::<u8>, ctx, values)
+                _ => build_array!(LargeBinaryBuilder, Vec::<u8>, ctx, values),
             },
             DataType::Decimal128(precision, scale) => {
                 let mut builder = Decimal128Builder::with_capacity(values.len())
                     .with_precision_and_scale(*precision, *scale)?;
 
-                let bigdecimal_to_string: Function = ctx
-                    .eval("BigDecimal.prototype.toString")
-                    .context("failed to get BigDecimal.prototype.string")?;
+                let bigdecimal_to_precision: Function = self.get_bigdecimal_to_precision_function(ctx)?;
 
                 for val in values {
                     if val.is_null() || val.is_undefined() {
@@ -303,28 +365,22 @@ impl Converter {
                     } else {
                         let mut args = Args::new(ctx.clone(), 0);
                         args.this(val)?;
-                        let string: String = bigdecimal_to_string.call_arg(args).context(
+                        args.push_arg(*precision)?;
+                        let string: String = bigdecimal_to_precision.call_arg(args).context(
                             "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
-                            )?;
+                        )?;
 
-                        // TODO: make into macro - the only parts that are different are the builder
-                        // instance and this logic that determines how the value is computed.
-                        let decimal_integer = self.decimal_string_to_i256(&string, *scale)?
-                            .to_i128()
-                            .ok_or_else(|| anyhow::anyhow!("failed to convert to i128"))?;
-
+                        let decimal_integer = self.decimal_string_to_i128(&string, *scale)?;
                         builder.append_value(decimal_integer);
                     }
                 }
                 Ok(Arc::new(builder.finish()))
-            },
+            }
             DataType::Decimal256(precision, scale) => {
                 let mut builder = Decimal256Builder::with_capacity(values.len())
                     .with_precision_and_scale(*precision, *scale)?;
 
-                let bigdecimal_to_string: Function = ctx
-                    .eval("BigDecimal.prototype.toString")
-                    .context("failed to get BigDecimal.prototype.string")?;
+                let bigdecimal_to_precision = self.get_bigdecimal_to_precision_function(ctx)?;
 
                 for val in values {
                     if val.is_null() || val.is_undefined() {
@@ -332,15 +388,38 @@ impl Converter {
                     } else {
                         let mut args = Args::new(ctx.clone(), 0);
                         args.this(val)?;
-                        let string: String = bigdecimal_to_string.call_arg(args).context(
+                        args.push_arg(*precision)?;
+                        let string: String = bigdecimal_to_precision.call_arg(args).context(
                             "failed to convert BigDecimal to string. make sure you return a BigDecimal value",
-                            )?;
+                        )?;
                         let decimal_integer = self.decimal_string_to_i256(&string, *scale)?;
                         builder.append_value(decimal_integer);
                     }
                 }
                 Ok(Arc::new(builder.finish()))
-            },
+            }
+            DataType::Timestamp(unit, _tz) => {
+                match unit {
+                    // TODO denomenator is not quite right because if the fundamental unit is in
+                    // milliseconds, then to convert nanoseconds to milliseconds, you need to divide by 1_000_000
+                    arrow_schema::TimeUnit::Second => {
+                        build_timestamp_array!(TimestampSecondBuilder, i64, ctx, values, /, 1000)
+                    }
+                    arrow_schema::TimeUnit::Millisecond => {
+                        build_timestamp_array!(TimestampMillisecondBuilder, i64, ctx, values, /, 1)
+                    }
+                    arrow_schema::TimeUnit::Microsecond => {
+                        build_timestamp_array!(TimestampMicrosecondBuilder, i64, ctx, values, *, 1000)
+                    }
+                    arrow_schema::TimeUnit::Nanosecond => {
+                        build_timestamp_array!(TimestampNanosecondBuilder, i64, ctx, values, *, 1000_000)
+                    }
+                }
+            }
+            //todo test and dedupe and add inverse
+            DataType::Date32 => {
+                build_timestamp_array!(Date32Builder, i32, ctx, values, /, 1000 * 60 * 60 * 24)
+            }
             // list
             DataType::List(inner) => {
                 // flatten lists
@@ -398,19 +477,50 @@ impl Converter {
         }
     }
 
-    fn decimal_string_to_i256(&self, s: &str, scale: i8) -> Result<i256> {
+    fn get_bigdecimal_to_precision_function<'a>(&self, ctx: &Ctx<'a>) -> Result<Function<'a>> {
+        ctx.eval("BigDecimal.prototype.toPrecision")
+            .context("failed to get BigDecimal.prototype.toPrecision")
+    }
+
+    fn decimal_string_to_i128(&self, s: &str, scale: i8) -> Result<i128> {
         if scale < 0 {
-            return Err(anyhow::anyhow!("currently only supports non-negative scale"));
+            return Err(anyhow::anyhow!(
+                "currently only supports non-negative scale"
+            ));
         }
 
-       let parts = s.split('.').collect::<Vec<&str>>();
-       let integer = i256::from_string(parts[0]).ok_or_else(|| anyhow::anyhow!("failed to parse integer part"))?;
-       let fractional = if parts.len() == 1 {
-           i256::ZERO
-       } else {
-           i256::from_string(parts[1]).ok_or_else(|| anyhow::anyhow!("failed to parse fractional part"))?
-       };
+        let parts = s.split('.').collect::<Vec<&str>>();
+        let integer = parts[0].parse::<i128>()
+            .context("failed to parse integer part")?;
+        let fractional = if parts.len() == 1 {
+            0
+        } else {
+            let fractional = parts[1][..scale as usize].to_string();
+            fractional.parse::<i128>()
+                .context("failed to parse fractional part")?
+        };
 
-       Ok((integer * i256::from_i128(10).pow_checked(scale as u32)?) + fractional)
+        Ok((integer * 10_i128.pow(scale as u32)) + fractional)
+    }
+
+    fn decimal_string_to_i256(&self, s: &str, scale: i8) -> Result<i256> {
+        if scale < 0 {
+            return Err(anyhow::anyhow!(
+                "currently only supports non-negative scale"
+            ));
+        }
+
+        let parts = s.split('.').collect::<Vec<&str>>();
+        let integer = i256::from_string(parts[0])
+            .ok_or_else(|| anyhow::anyhow!("failed to parse integer part"))?;
+        let fractional = if parts.len() == 1 {
+            i256::ZERO
+        } else {
+            let fractional = parts[1][..scale as usize].to_string();
+            i256::from_string(&fractional)
+                .ok_or_else(|| anyhow::anyhow!("failed to parse fractional part"))?
+        };
+
+        Ok((integer * i256::from_i128(10).pow_checked(scale as u32)?) + fractional)
     }
 }

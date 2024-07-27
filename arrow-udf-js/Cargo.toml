@@ -14,7 +14,10 @@ arrow-array = { workspace = true }
 arrow-buffer = ">=50"
 arrow-schema = { workspace = true }
 atomic-time = "0.1"
-rquickjs = { version = "0.6", features = ["array-buffer", "parallel"] }
+# rquickjs = { version = "0.6", features = ["array-buffer", "dump-free", "dump-leaks"] }
+rquickjs = { version = "0.6", features = ["array-buffer", "dump-leaks"] }
+# use github version
+# rquickjs = { git = "https://github.com/DelSkayn/rquickjs", rev = "1a398d9", features = ["array-buffer", "parallel"] }
 
 [dev-dependencies]
 arrow-cast = { version = ">=50", features = ["prettyprint"] }

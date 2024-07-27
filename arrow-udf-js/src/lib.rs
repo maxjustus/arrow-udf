@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Mutex;
 use std::sync::{atomic::Ordering, Arc};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,8 @@ pub use self::into_field::IntoField;
 mod into_field;
 mod jsarrow;
 
+// TODO: first pass at multithreaded should just do away with function caching
+// - just store function text and eval each time.
 /// A runtime to execute user defined functions in JavaScript.
 ///
 /// # Usages
@@ -58,17 +61,119 @@ mod jsarrow;
 /// [`merge`]: Runtime::merge
 /// [`finish`]: Runtime::finish
 pub struct Runtime {
-    functions: HashMap<String, Function>,
-    aggregates: HashMap<String, Aggregate>,
+    functions: HashMap<String, FunctionDefinition>, // - each instance will lazy init and cache
+    aggregates: HashMap<String, AggregateDefinition>,
     // NOTE: `functions` and `aggregates` must be put before the `runtime` and `context` to be dropped first.
     converter: jsarrow::Converter,
-    runtime: rquickjs::Runtime,
-    context: Context,
+    memory_limit: Option<usize>,
+    // this needs to be contexts
+    instances: Mutex<Vec<Instance>>,
     /// Timeout of each function call.
     timeout: Option<Duration>,
+}
+
+pub struct Instance {
+    // drop functions before dropping context or quickjs will panic due to functions not being
+    // freed before the context is freed
+    functions: HashMap<String, Function>,
+    aggregates: HashMap<String, Aggregate>,
+    context: Context,
+    runtime: rquickjs::Runtime,
     /// Deadline of the current function call.
     deadline: Arc<atomic_time::AtomicOptionInstant>,
 }
+
+// right now this just makes a new context each time
+// which I might argue is not the worst thing, since quickjs is
+// made for fast startup.. Hmm
+fn build_context<'a>() -> Result<Context> {
+    let runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
+    let context = rquickjs::Context::custom::<All>(&runtime)
+        .context("failed to create quickjs context")?;
+    Ok(context)
+}
+
+fn get_function<'a>(
+    ctx: &Ctx<'a>,
+    module: &Module<'a, Evaluated>,
+    name: &str,
+) -> Result<JsFunction> {
+    let function: rquickjs::Function = module.get(name).with_context(|| {
+        format!("function \"{name}\" not found. HINT: make sure the function is exported")
+    })?;
+    // not ideal to call this even for just testing if the function is valid
+    // should not do a save here I don't think..
+    Ok(Persistent::save(ctx, function))
+}
+
+// TODO: currently this is not used. Eventually this should be a pool
+impl Instance {
+    pub fn new(rt: &Runtime) -> Result<Self> {
+        let instance_runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
+        let context = rquickjs::Context::custom::<All>(&instance_runtime)
+            .context("failed to create quickjs context")?;
+
+        let deadline = Arc::new(atomic_time::AtomicOptionInstant::new(None));
+
+        if let Some(memory_limit) = rt.memory_limit {
+            instance_runtime.set_memory_limit(memory_limit);
+        }
+        if let Some(deadline) = deadline.load(Ordering::Relaxed) {
+            instance_runtime.set_interrupt_handler(Some(Box::new(move || {
+                return deadline <= Instant::now();
+            })));
+        }
+
+        Ok(Self {
+            runtime: instance_runtime,
+            context,
+            functions: HashMap::new(),
+            aggregates: HashMap::new(),
+            deadline,
+        })
+    }
+
+    // pub fn add_function(
+    //     &mut self,
+    //     name: &str,
+    //     return_type: impl IntoField,
+    //     mode: CallMode,
+    //     code: &str,
+    //     handler: &str,
+    // ) -> Result<()> {
+    //     let function = self.context.with(|ctx| {
+    //         let (module, _) = Module::declare(ctx.clone(), name, code)
+    //             .map_err(|e| check_exception(e, &ctx))
+    //             .context("failed to declare module")?
+    //             .eval()
+    //             .map_err(|e| check_exception(e, &ctx))
+    //             .context("failed to evaluate module")?;
+    //         Self::get_function(&ctx, &module, handler)
+    //     })?;
+    //     let function = Function {
+    //         function,
+    //         return_field: return_type.into_field(name).into(),
+    //         mode,
+    //     };
+    //     self.functions.insert(name.to_string(), function);
+    //     Ok(())
+    // }
+
+    /// Get a function from a module.
+    fn get_function<'a>(
+        ctx: &Ctx<'a>,
+        module: &Module<'a, Evaluated>,
+        name: &str,
+    ) -> Result<JsFunction> {
+        let function: rquickjs::Function = module.get(name).with_context(|| {
+            format!("function \"{name}\" not found. HINT: make sure the function is exported")
+        })?;
+        Ok(Persistent::save(ctx, function))
+    }
+}
+
+// how would function adding work if we have multiple instances?
+// lazy init and cache?
 
 impl Debug for Runtime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -87,6 +192,14 @@ struct Function {
     mode: CallMode,
 }
 
+struct FunctionDefinition {
+    name: String,
+    return_type: Field,
+    mode: CallMode,
+    handler: String,
+    code: String,
+}
+
 /// A user defined aggregate function.
 struct Aggregate {
     state_field: FieldRef,
@@ -99,6 +212,14 @@ struct Aggregate {
     merge: Option<JsFunction>,
 }
 
+struct AggregateDefinition {
+    name: String,
+    state_type: DataType,
+    output_type: DataType,
+    mode: CallMode,
+    code: String,
+}
+
 /// A persistent function.
 type JsFunction = Persistent<rquickjs::Function<'static>>;
 
@@ -107,7 +228,7 @@ unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
 
 /// Whether the function will be called when some of its arguments are null.
-#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum CallMode {
     /// The function will be called normally when some of its arguments are null.
     /// It is then the function author's responsibility to check for null values if necessary and respond appropriately.
@@ -123,17 +244,13 @@ pub enum CallMode {
 impl Runtime {
     /// Create a new `Runtime`.
     pub fn new() -> Result<Self> {
-        let runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
-        let context = rquickjs::Context::custom::<All>(&runtime)
-            .context("failed to create quickjs context")?;
-
         Ok(Self {
             functions: HashMap::new(),
             aggregates: HashMap::new(),
-            runtime,
-            context,
+            instances: Mutex::new(vec![]),
+            memory_limit: None,
             timeout: None,
-            deadline: Default::default(),
+            // deadline: Default::default(),
             converter: jsarrow::Converter::new(),
         })
     }
@@ -147,8 +264,9 @@ impl Runtime {
     /// let runtime = Runtime::new().unwrap();
     /// runtime.set_memory_limit(Some(1 << 20)); // 1MB
     /// ```
-    pub fn set_memory_limit(&self, limit: Option<usize>) {
-        self.runtime.set_memory_limit(limit.unwrap_or(0));
+    pub fn set_memory_limit(&mut self, limit: Option<usize>) {
+        self.memory_limit = limit;
+        // self.runtime.set_memory_limit(limit.unwrap_or(0));
     }
 
     /// Set the timeout of each function call.
@@ -163,17 +281,17 @@ impl Runtime {
     /// ```
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
-        if timeout.is_some() {
-            let deadline = self.deadline.clone();
-            self.runtime.set_interrupt_handler(Some(Box::new(move || {
-                if let Some(deadline) = deadline.load(Ordering::Relaxed) {
-                    return deadline <= Instant::now();
+        self.instances.lock().unwrap().iter().for_each(|instance| {
+            if timeout.is_some() {
+                if let Some(deadline) = instance.deadline.load(Ordering::Relaxed) {
+                    instance.runtime.set_interrupt_handler(Some(Box::new(move || {
+                        return deadline <= Instant::now();
+                    })));
                 }
-                false
-            })));
-        } else {
-            self.runtime.set_interrupt_handler(None);
-        }
+            } else {
+                instance.runtime.set_interrupt_handler(None);
+            }
+        });
     }
 
     /// Get memory usage of the internal quickjs runtime.
@@ -186,7 +304,14 @@ impl Runtime {
     /// let usage = runtime.memory_usage();
     /// ```
     pub fn memory_usage(&self) -> MemoryUsage {
-        self.runtime.memory_usage()
+        // just trying to make it pass for a sec
+        let instance = Instance::new(self).unwrap();
+        // TODO: this is problematic because we have multiple instances
+        // and this is an internal qjs runtime memory usage
+        // struct. Just returning the first instance's memory usage for now.
+        // maybe eventually it's summed or something?
+        // self.instances.lock().unwrap()[0].runtime.memory_usage()
+        return instance.runtime.memory_usage();
     }
 
     /// Return the converter where you can configure the extension metadata key and values.
@@ -272,34 +397,32 @@ impl Runtime {
         code: &str,
         handler: &str,
     ) -> Result<()> {
-        let function = self.context.with(|ctx| {
+        // temporary context for testing if the function is valid
+        let context = build_context()?;
+
+        // // we run this to check if the function is valid when adding
+        // // TODO: pull this into shared function or macro
+        // // both for validating here and for calling with memo
+        context.with(|ctx| {
             let (module, _) = Module::declare(ctx.clone(), name, code)
                 .map_err(|e| check_exception(e, &ctx))
                 .context("failed to declare module")?
                 .eval()
                 .map_err(|e| check_exception(e, &ctx))
                 .context("failed to evaluate module")?;
-            Self::get_function(&ctx, &module, handler)
+            get_function(&ctx, &module, handler)
         })?;
-        let function = Function {
-            function,
-            return_field: return_type.into_field(name).into(),
+
+        let function = FunctionDefinition {
+            name: name.to_string(),
+            // this needs to be a Field and not a DataType to retain metadata
+            return_type: return_type.into_field(name).clone(),
             mode,
+            handler: handler.to_string(),
+            code: code.to_string(),
         };
         self.functions.insert(name.to_string(), function);
         Ok(())
-    }
-
-    /// Get a function from a module.
-    fn get_function<'a>(
-        ctx: &Ctx<'a>,
-        module: &Module<'a, Evaluated>,
-        name: &str,
-    ) -> Result<JsFunction> {
-        let function: rquickjs::Function = module.get(name).with_context(|| {
-            format!("function \"{name}\" not found. HINT: make sure the function is exported")
-        })?;
-        Ok(Persistent::save(ctx, function))
     }
 
     /// Add a new aggregate function.
@@ -359,12 +482,16 @@ impl Runtime {
     pub fn add_aggregate(
         &mut self,
         name: &str,
-        state_type: impl IntoField,
-        output_type: impl IntoField,
+        state_type: impl IntoField + Clone,
+        output_type: impl IntoField + Clone,
         mode: CallMode,
         code: &str,
     ) -> Result<()> {
-        let aggregate = self.context.with(|ctx| {
+        let context = build_context()?;
+
+        // TODO: pull this into shared function
+        // both for validating here and for calling with memo
+        let aggregate = context.with(|ctx| {
             let (module, _) = Module::declare(ctx.clone(), name, code)
                 .map_err(|e| check_exception(e, &ctx))
                 .context("failed to declare module")?
@@ -372,20 +499,30 @@ impl Runtime {
                 .map_err(|e| check_exception(e, &ctx))
                 .context("failed to evaluate module")?;
             Ok(Aggregate {
-                state_field: state_type.into_field(name).into(),
-                output_field: output_type.into_field(name).into(),
-                mode,
-                create_state: Self::get_function(&ctx, &module, "create_state")?,
-                accumulate: Self::get_function(&ctx, &module, "accumulate")?,
-                retract: Self::get_function(&ctx, &module, "retract").ok(),
-                finish: Self::get_function(&ctx, &module, "finish").ok(),
-                merge: Self::get_function(&ctx, &module, "merge").ok(),
+                state_field: state_type.clone().into_field(name).into(),
+                output_field: output_type.clone().into_field(name).into(),
+                mode: mode.clone(),
+                create_state: get_function(&ctx, &module, "create_state")?,
+                accumulate: get_function(&ctx, &module, "accumulate")?,
+                retract: get_function(&ctx, &module, "retract").ok(),
+                finish: get_function(&ctx, &module, "finish").ok(),
+                merge: get_function(&ctx, &module, "merge").ok(),
             }) as Result<Aggregate>
         })?;
+
         if aggregate.finish.is_none() && aggregate.state_field != aggregate.output_field {
             bail!("`output_type` must be the same as `state_type` when `finish` is not defined");
         }
-        self.aggregates.insert(name.to_string(), aggregate);
+
+        let definition = AggregateDefinition {
+            name: name.to_string(),
+            state_type: state_type.into_field(name).data_type().clone(),
+            output_type: output_type.into_field(name).data_type().clone(),
+            mode,
+            code: code.to_string(),
+        };
+
+        self.aggregates.insert(name.to_string(), definition);
         Ok(())
     }
 
@@ -410,12 +547,52 @@ impl Runtime {
     /// assert_eq!(&**output.column(0), &Int32Array::from(vec![Some(5), None]));
     /// ```
     pub fn call(&self, name: &str, input: &RecordBatch) -> Result<RecordBatch> {
-        let function = self.functions.get(name).context("function not found")?;
-        // convert each row to python objects and call the function
-        self.context.with(|ctx| {
+        let function_definition = self.functions.get(name).context("function not found")?;
+
+        // TODO: build and grab from cached instances array like wasm does
+        // instead of creating a new instance each time
+        let mut instance = if let Some(instance) = self.instances.lock().unwrap().pop() {
+            instance
+        } else {
+            Instance::new(self)?
+        };
+
+        let context = instance.context.clone();
+        // let context = build_context()?;
+
+        let function_mode = function_definition.mode.clone();
+
+        // convert each row to js objects and call the function
+        let res = context.with(|ctx| {
+            // lazy instantiate and cache - TOOD: clean this up/extract
+            let function = if let Some(function) = instance.functions.get(name) {
+                function
+            } else {
+                let (module, _) = Module::declare(ctx.clone(), name, function_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+
+                let js_function = get_function(&ctx, &module, &function_definition.handler)?;
+
+                let function = Function {
+                    function: js_function,
+                    return_field: function_definition.return_type.clone().into_field(name).into(),
+                    mode: function_mode.clone(),
+                };
+
+                instance.functions.insert(name.to_string(), function);
+
+                instance.functions.get(name).unwrap()
+            };
+
             let js_function = function.function.clone().restore(&ctx)?;
             let mut results = Vec::with_capacity(input.num_rows());
             let mut row = Vec::with_capacity(input.num_columns());
+
+            // what if this were an iterator instead?
             for i in 0..input.num_rows() {
                 row.clear();
                 for (column, field) in input.columns().iter().zip(input.schema().fields()) {
@@ -426,7 +603,7 @@ impl Runtime {
 
                     row.push(val);
                 }
-                if function.mode == CallMode::ReturnNullOnNullInput
+                if function_mode == CallMode::ReturnNullOnNullInput
                     && row.iter().any(|v| v.is_null())
                 {
                     results.push(Value::new_null(ctx.clone()));
@@ -446,7 +623,11 @@ impl Runtime {
                 .context("failed to build arrow array from return values")?;
             let schema = Schema::new(vec![function.return_field.clone()]);
             Ok(RecordBatch::try_new(Arc::new(schema), vec![array])?)
-        })
+        });
+
+        self.instances.lock().unwrap().push(instance);
+
+        res
     }
 
     /// Call a table function.
@@ -482,7 +663,30 @@ impl Runtime {
         chunk_size: usize,
     ) -> Result<RecordBatchIter<'a>> {
         assert!(chunk_size > 0);
-        let function = self.functions.get(name).context("function not found")?;
+        let function_definition = self.functions.get(name).context("function not found")?;
+
+        // TODO: build and grab from cached instances array like wasm does
+        // instead of creating a new instance each time
+        let context = build_context()?;
+
+        let function = context.with(|ctx| {
+            let (module, _) = Module::declare(ctx.clone(), name, function_definition.code.clone())
+                .map_err(|e| check_exception(e, &ctx))
+                .context("failed to declare module")?
+                .eval()
+                .map_err(|e| check_exception(e, &ctx))
+                .context("failed to evaluate module")?;
+            get_function(&ctx, &module, &function_definition.handler)
+        })?;
+
+        // use 'a lifetime for this
+        let function = Function {
+            function: function.clone(),
+            return_field: function_definition.return_type.clone().into_field(name).into(),
+            mode: function_definition.mode.clone(),
+        };
+
+        let return_field = function.return_field.clone();
 
         // initial state
         Ok(RecordBatchIter {
@@ -491,7 +695,7 @@ impl Runtime {
             function,
             schema: Arc::new(Schema::new(vec![
                 Arc::new(Field::new("row", DataType::Int32, false)),
-                function.return_field.clone(),
+                return_field,
             ])),
             chunk_size,
             row: 0,
@@ -509,8 +713,68 @@ impl Runtime {
     /// assert_eq!(&*state, &Int32Array::from(vec![0]));
     /// ```
     pub fn create_state(&self, name: &str) -> Result<ArrayRef> {
-        let aggregate = self.aggregates.get(name).context("function not found")?;
-        let state = self.context.with(|ctx| {
+        let aggregate_definition = self.aggregates.get(name).context("function not found")?;
+        let context = build_context()?;
+
+        // no clue if this is right.. just getting things compiling. TODO: test/revisit
+        let aggregate = Aggregate {
+            state_field: aggregate_definition.state_type.clone().into_field(name).into(),
+            output_field: aggregate_definition.output_type.clone().into_field(name).into(),
+            mode: aggregate_definition.mode.clone(),
+            create_state: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "create_state")
+            })?,
+            accumulate: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "accumulate")
+            })?,
+            retract: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "retract").ok()
+            }),
+            finish: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "finish").ok()
+            }),
+            merge: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "merge").ok()
+            }),
+        };
+
+        let state = context.with(|ctx| {
             let create_state = aggregate.create_state.clone().restore(&ctx)?;
             let state = self
                 .call_user_fn(&ctx, &create_state, Args::new(ctx.clone(), 0))
@@ -543,9 +807,69 @@ impl Runtime {
         state: &dyn Array,
         input: &RecordBatch,
     ) -> Result<ArrayRef> {
-        let aggregate = self.aggregates.get(name).context("function not found")?;
+        let aggregate_definition = self.aggregates.get(name).context("function not found")?;
+        let context = build_context()?;
+
+        // no clue if this is right.. just getting things compiling. TODO: test/revisit
+        let aggregate = Aggregate {
+            state_field: aggregate_definition.state_type.clone().into_field(name).into(),
+            output_field: aggregate_definition.output_type.clone().into_field(name).into(),
+            mode: aggregate_definition.mode.clone(),
+            create_state: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "create_state")
+            })?,
+            accumulate: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "accumulate")
+            })?,
+            retract: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "retract").ok()
+            }),
+            finish: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "finish").ok()
+            }),
+            merge: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "merge").ok()
+            }),
+        };
+
         // convert each row to python objects and call the accumulate function
-        let new_state = self.context.with(|ctx| {
+        let new_state = context.with(|ctx| {
             let accumulate = aggregate.accumulate.clone().restore(&ctx)?;
             let mut state = self
                 .converter
@@ -603,9 +927,69 @@ impl Runtime {
         ops: &BooleanArray,
         input: &RecordBatch,
     ) -> Result<ArrayRef> {
-        let aggregate = self.aggregates.get(name).context("function not found")?;
+        let aggregate_definition = self.aggregates.get(name).context("function not found")?;
+        let context = build_context()?;
+
+        // no clue if this is right.. just getting things compiling. TODO: test/revisit
+        let aggregate = Aggregate {
+            state_field: aggregate_definition.state_type.clone().into_field(name).into(),
+            output_field: aggregate_definition.output_type.clone().into_field(name).into(),
+            mode: aggregate_definition.mode.clone(),
+            create_state: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "create_state")
+            })?,
+            accumulate: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "accumulate")
+            })?,
+            retract: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "retract").ok()
+            }),
+            finish: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "finish").ok()
+            }),
+            merge: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "merge").ok()
+            }),
+        };
+
         // convert each row to python objects and call the accumulate function
-        let new_state = self.context.with(|ctx| {
+        let new_state = context.with(|ctx| {
             let accumulate = aggregate.accumulate.clone().restore(&ctx)?;
             let retract = aggregate
                 .retract
@@ -660,8 +1044,68 @@ impl Runtime {
     /// assert_eq!(&*state, &Int32Array::from(vec![9]));
     /// ```
     pub fn merge(&self, name: &str, states: &dyn Array) -> Result<ArrayRef> {
-        let aggregate = self.aggregates.get(name).context("function not found")?;
-        let output = self.context.with(|ctx| {
+        let aggregate_definition = self.aggregates.get(name).context("function not found")?;
+        let context = build_context()?;
+
+        // no clue if this is right.. just getting things compiling. TODO: test/revisit
+        let aggregate = Aggregate {
+            state_field: aggregate_definition.state_type.clone().into_field(name).into(),
+            output_field: aggregate_definition.output_type.clone().into_field(name).into(),
+            mode: aggregate_definition.mode.clone(),
+            create_state: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "create_state")
+            })?,
+            accumulate: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "accumulate")
+            })?,
+            retract: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "retract").ok()
+            }),
+            finish: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "finish").ok()
+            }),
+            merge: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "merge").ok()
+            }),
+        };
+
+        let output = context.with(|ctx| {
             let merge = aggregate
                 .merge
                 .clone()
@@ -704,11 +1148,72 @@ impl Runtime {
     /// assert_eq!(&outputs, &states);
     /// ```
     pub fn finish(&self, name: &str, states: &ArrayRef) -> Result<ArrayRef> {
-        let aggregate = self.aggregates.get(name).context("function not found")?;
+        let aggregate_definition = self.aggregates.get(name).context("function not found")?;
+        let context = build_context()?;
+
+        // no clue if this is right.. just getting things compiling. TODO: test/revisit
+        let aggregate = Aggregate {
+            state_field: aggregate_definition.state_type.clone().into_field(name).into(),
+            output_field: aggregate_definition.output_type.clone().into_field(name).into(),
+            mode: aggregate_definition.mode.clone(),
+            create_state: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "create_state")
+            })?,
+            accumulate: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")?;
+                get_function(&ctx, &module, "accumulate")
+            })?,
+            retract: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "retract").ok()
+            }),
+            finish: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "finish").ok()
+            }),
+            merge: context.with(|ctx| {
+                let (module, _) = Module::declare(ctx.clone(), name, aggregate_definition.code.clone())
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to declare module")
+                    .ok()?
+                    .eval()
+                    .map_err(|e| check_exception(e, &ctx))
+                    .context("failed to evaluate module")
+                    .ok()?;
+                get_function(&ctx, &module, "merge").ok()
+            }),
+        };
+
         let Some(finish) = &aggregate.finish else {
             return Ok(states.clone());
         };
-        let output = self.context.with(|ctx| {
+
+        let output = context.with(|ctx| {
             let finish = finish.clone().restore(&ctx)?;
             let mut results = Vec::with_capacity(states.len());
             for i in 0..states.len() {
@@ -743,15 +1248,21 @@ impl Runtime {
         f: &rquickjs::Function<'js>,
         args: Args<'js>,
     ) -> Result<T> {
-        let result = if let Some(timeout) = self.timeout {
-            self.deadline
-                .store(Some(Instant::now() + timeout), Ordering::Relaxed);
-            let result = f.call_arg(args);
-            self.deadline.store(None, Ordering::Relaxed);
-            result
-        } else {
-            f.call_arg(args)
-        };
+        // let context = build_context()?;
+
+        // obvs wrong, just getting things compiling to test base scalar parallelism
+        // let deadline = Arc::new(atomic_time::AtomicOptionInstant::new(None));
+
+        let result = f.call_arg(args);
+        // let result = if let Some(timeout) = self.timeout {
+        //     deadline
+        //         .store(Some(Instant::now() + timeout), Ordering::Relaxed);
+        //     let result = f.call_arg(args);
+        //     deadline.store(None, Ordering::Relaxed);
+        //     result
+        // } else {
+        //     f.call_arg(args)
+        // };
         result.map_err(|e| check_exception(e, ctx))
     }
 }
@@ -760,7 +1271,7 @@ impl Runtime {
 pub struct RecordBatchIter<'a> {
     rt: &'a Runtime,
     input: &'a RecordBatch,
-    function: &'a Function,
+    function: Function,
     schema: SchemaRef,
     chunk_size: usize,
     // mutable states
@@ -784,7 +1295,10 @@ impl RecordBatchIter<'_> {
         if self.row == self.input.num_rows() {
             return Ok(None);
         }
-        self.rt.context.with(|ctx| {
+
+        let context = build_context()?;
+
+        context.with(|ctx| {
             let js_function = self.function.function.clone().restore(&ctx)?;
             let mut indexes = Int32Builder::with_capacity(self.chunk_size);
             let mut results = Vec::with_capacity(self.input.num_rows());

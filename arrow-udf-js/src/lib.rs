@@ -101,12 +101,12 @@ fn get_function<'a>(
     let function: rquickjs::Function = module.get(name).with_context(|| {
         format!("function \"{name}\" not found. HINT: make sure the function is exported")
     })?;
+
     // not ideal to call this even for just testing if the function is valid
     // should not do a save here I don't think..
     Ok(Persistent::save(ctx, function))
 }
 
-// TODO: currently this is not used. Eventually this should be a pool
 impl Instance {
     pub fn new(rt: &Runtime) -> Result<Self> {
         let instance_runtime = rquickjs::Runtime::new().context("failed to create quickjs runtime")?;
@@ -115,14 +115,14 @@ impl Instance {
 
         let deadline = Arc::new(atomic_time::AtomicOptionInstant::new(None));
 
-        if let Some(memory_limit) = rt.memory_limit {
-            instance_runtime.set_memory_limit(memory_limit);
-        }
-        if let Some(deadline) = deadline.load(Ordering::Relaxed) {
-            instance_runtime.set_interrupt_handler(Some(Box::new(move || {
-                return deadline <= Instant::now();
-            })));
-        }
+        // if let Some(memory_limit) = rt.memory_limit {
+        //     instance_runtime.set_memory_limit(memory_limit);
+        // }
+        // if let Some(deadline) = deadline.load(Ordering::Relaxed) {
+        //     instance_runtime.set_interrupt_handler(Some(Box::new(move || {
+        //         return deadline <= Instant::now();
+        //     })));
+        // }
 
         Ok(Self {
             runtime: instance_runtime,

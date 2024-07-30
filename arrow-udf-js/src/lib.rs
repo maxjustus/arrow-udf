@@ -410,6 +410,7 @@ impl Runtime {
                 .eval()
                 .map_err(|e| check_exception(e, &ctx))
                 .context("failed to evaluate module")?;
+
             get_function(&ctx, &module, handler)
         })?;
 
@@ -549,25 +550,13 @@ impl Runtime {
     pub fn call(&self, name: &str, input: &RecordBatch) -> Result<RecordBatch> {
         let function_definition = self.functions.get(name).context("function not found")?;
 
-        // TODO: build and grab from cached instances array like wasm does
-        // instead of creating a new instance each time
-        let mut instance = if let Some(instance) = self.instances.lock().unwrap().pop() {
-            instance
-        } else {
-            Instance::new(self)?
-        };
-
-        let context = instance.context.clone();
-        // let context = build_context()?;
+        let context = build_context()?;
 
         let function_mode = function_definition.mode.clone();
 
         // convert each row to js objects and call the function
         let res = context.with(|ctx| {
-            // lazy instantiate and cache - TOOD: clean this up/extract
-            let function = if let Some(function) = instance.functions.get(name) {
-                function
-            } else {
+            let js_function = {
                 let (module, _) = Module::declare(ctx.clone(), name, function_definition.code.clone())
                     .map_err(|e| check_exception(e, &ctx))
                     .context("failed to declare module")?
@@ -575,20 +564,13 @@ impl Runtime {
                     .map_err(|e| check_exception(e, &ctx))
                     .context("failed to evaluate module")?;
 
-                let js_function = get_function(&ctx, &module, &function_definition.handler)?;
+                module.get(&function_definition.handler).with_context(|| {
+                    format!("function \"{name}\" not found. HINT: make sure the function is exported")
+                })
+            }?;
 
-                let function = Function {
-                    function: js_function,
-                    return_field: function_definition.return_type.clone().into_field(name).into(),
-                    mode: function_mode.clone(),
-                };
+            let return_field = function_definition.return_type.clone().into_field(name).into();
 
-                instance.functions.insert(name.to_string(), function);
-
-                instance.functions.get(name).unwrap()
-            };
-
-            let js_function = function.function.clone().restore(&ctx)?;
             let mut results = Vec::with_capacity(input.num_rows());
             let mut row = Vec::with_capacity(input.num_columns());
 
@@ -619,13 +601,11 @@ impl Runtime {
 
             let array = self
                 .converter
-                .build_array(&function.return_field, &ctx, results)
+                .build_array(&return_field, &ctx, results)
                 .context("failed to build arrow array from return values")?;
-            let schema = Schema::new(vec![function.return_field.clone()]);
+            let schema = Schema::new(vec![return_field.clone()]);
             Ok(RecordBatch::try_new(Arc::new(schema), vec![array])?)
         });
-
-        self.instances.lock().unwrap().push(instance);
 
         res
     }

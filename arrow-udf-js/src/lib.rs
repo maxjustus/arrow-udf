@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::sync::{atomic::Ordering, Arc};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Error, Result};
 use arrow_array::{builder::Int32Builder, Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 pub use rquickjs::runtime::MemoryUsage;
@@ -198,6 +198,7 @@ struct FunctionDefinition {
     mode: CallMode,
     handler: String,
     code: String,
+    bytecode: Vec<u8>,
 }
 
 /// A user defined aggregate function.
@@ -400,18 +401,14 @@ impl Runtime {
         // temporary context for testing if the function is valid
         let context = build_context()?;
 
-        // // we run this to check if the function is valid when adding
-        // // TODO: pull this into shared function or macro
-        // // both for validating here and for calling with memo
-        context.with(|ctx| {
-            let (module, _) = Module::declare(ctx.clone(), name, code)
+        // compile module to bytecode for fast loading
+        let bytecode = context.with(|ctx| {
+            let module = Module::declare(ctx.clone(), name, code)
                 .map_err(|e| check_exception(e, &ctx))
-                .context("failed to declare module")?
-                .eval()
-                .map_err(|e| check_exception(e, &ctx))
-                .context("failed to evaluate module")?;
+                .context("failed to declare module")?;
 
-            get_function(&ctx, &module, handler)
+            module.write(false)
+                .map_err(|e| check_exception(e, &ctx))
         })?;
 
         let function = FunctionDefinition {
@@ -421,6 +418,7 @@ impl Runtime {
             mode,
             handler: handler.to_string(),
             code: code.to_string(),
+            bytecode,
         };
         self.functions.insert(name.to_string(), function);
         Ok(())
@@ -557,9 +555,9 @@ impl Runtime {
         // convert each row to js objects and call the function
         let res = context.with(|ctx| {
             let js_function = {
-                let (module, _) = Module::declare(ctx.clone(), name, function_definition.code.clone())
+                let (module, _) = unsafe { Module::load(ctx.clone(), &function_definition.bytecode) }
                     .map_err(|e| check_exception(e, &ctx))
-                    .context("failed to declare module")?
+                    .context("failed to load module")?
                     .eval()
                     .map_err(|e| check_exception(e, &ctx))
                     .context("failed to evaluate module")?;
